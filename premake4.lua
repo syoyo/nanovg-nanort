@@ -16,11 +16,11 @@ solution "nanovg-nanort"
 		
 		configuration "Debug"
 			defines { "DEBUG" }
-			flags { "Symbols", "ExtraWarnings"}
+			flags { "Symbols"}
 
 		configuration "Release"
 			defines { "NDEBUG" }
-			flags { "Optimize", "ExtraWarnings"}
+			flags { "Optimize"}
 
 
 	project "example_rt"

@@ -63,6 +63,7 @@ enum NVGcreateFlags {
 
 NVGcontext *nvgCreateRT(int flags, int w, int h);
 void nvgDeleteRT(NVGcontext *ctx);
+void nvgClearBackgroundRT(NVGcontext *ctx, float r, float g, float b, float a); // Clear background.
 unsigned char *nvgReadPixelsRT(NVGcontext *ctx); // Returns RGBA8 pixel data.
 
 // These are additional flags on top of NVGimageFlags.
@@ -2394,10 +2395,9 @@ NVGcontext *nvgCreateRT(int flags, int w, int h) {
   rt->height = h;
   rt->pixels = (unsigned char *)malloc(rt->width * rt->height * 4);
   for (size_t i = 0; i < rt->width * rt->height; i++) {
-    // glClearColor(0.3f, 0.3f, 0.32f, 1.0f);
-    rt->pixels[4 * i + 0] = 77;
-    rt->pixels[4 * i + 1] = 77;
-    rt->pixels[4 * i + 2] = 82;
+    rt->pixels[4 * i + 0] = 0;
+    rt->pixels[4 * i + 1] = 0;
+    rt->pixels[4 * i + 2] = 0;
     rt->pixels[4 * i + 3] = 255;
   }
 
@@ -2445,6 +2445,20 @@ unsigned int nvglImageHandle(NVGcontext *ctx, int image) {
   RTNVGcontext *rt = (RTNVGcontext *)nvgInternalParams(ctx)->userPtr;
   RTNVGtexture *tex = rtnvg__findTexture(rt, image);
   return tex->tex;
+}
+
+void nvgClearBackgroundRT(NVGcontext *ctx, float r, float g, float b, float a) {
+  RTNVGcontext *rt = (RTNVGcontext *)nvgInternalParams(ctx)->userPtr;
+  unsigned char red = ftouc(r);
+  unsigned char green = ftouc(g);
+  unsigned char blue = ftouc(b);
+  unsigned char alpha = ftouc(a);
+  for (size_t i = 0; i < rt->width * rt->height; i++) {
+    rt->pixels[4 * i + 0] = red;
+    rt->pixels[4 * i + 1] = green;
+    rt->pixels[4 * i + 2] = blue;
+    rt->pixels[4 * i + 3] = alpha;
+  }
 }
 
 unsigned char *nvgReadPixelsRT(NVGcontext *ctx) {

@@ -33,6 +33,8 @@ if (vg == NULL) {
 	return -1;
 }
 
+nvgClearBackgroundRT(vg, 0.3f, 0.3f, 0.32f, 1.0f);
+
 nvgBeginFrame(vg, winWidth, winHeight, pxRatio);
 
 // ... call nvg API here as usual ...
