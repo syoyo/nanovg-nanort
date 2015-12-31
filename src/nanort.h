@@ -330,7 +330,7 @@ struct float3 {
   void normalize() {
     float len = length();
     if (fabs(len) > 1.0e-6f) {
-      float inv_len = 1.0 / len;
+      float inv_len = 1.0f / len;
       x *= inv_len;
       y *= inv_len;
       z *= inv_len;
@@ -596,7 +596,7 @@ struct BVHBuildOptions {
 
   // Set default value: Taabb = 0.2
   BVHBuildOptions()
-      : costTaabb(0.2), minLeafPrimitives(4), maxTreeDepth(256), binSize(64),
+      : costTaabb(0.2f), minLeafPrimitives(4), maxTreeDepth(256), binSize(64),
         shallowDepth(3), minPrimitivesForParallelBuild(1024 * 128),
         cacheBBox(false) {}
 };
@@ -760,7 +760,7 @@ struct BinBuffer {
 
 inline float CalculateSurfaceArea(const float3 &min, const float3 &max) {
   float3 box = max - min;
-  return 2.0 * (box[0] * box[1] + box[1] * box[2] + box[2] * box[0]);
+  return 2.0f * (box[0] * box[1] + box[1] * box[2] + box[2] * box[0]);
 }
 
 inline void GetBoundingBoxOfTriangle(float3 &bmin, float3 &bmax,
@@ -836,7 +836,7 @@ void ContributeBinBuffer(BinBuffer *bins, // [out]
     float3 quantizedBMax = (bmax - sceneMin) * sceneInvSize;
 
     // idx is now in [0, BIN_SIZE)
-    for (size_t j = 0; j < 3; ++j) {
+    for (int j = 0; j < 3; ++j) {
       int q0 = (int)quantizedBMin[j];
       if (q0 < 0)
         q0 = 0;
@@ -848,9 +848,9 @@ void ContributeBinBuffer(BinBuffer *bins, // [out]
       idxBMax[j] = (unsigned int)q1;
 
       if (idxBMin[j] >= binSize)
-        idxBMin[j] = binSize - 1;
+        idxBMin[j] = (size_t)binSize - 1;
       if (idxBMax[j] >= binSize)
-        idxBMax[j] = binSize - 1;
+        idxBMax[j] = (size_t)binSize - 1;
 
       assert(idxBMin[j] < binSize);
       assert(idxBMax[j] < binSize);
@@ -890,17 +890,17 @@ bool FindCutFromBinBuffer(float *cutPos,    // [out] xyz
   float pos;
   float minCost[3];
 
-  float costTtri = 1.0 - costTaabb;
+  float costTtri = 1.0f - costTaabb;
 
   minCostAxis = 0;
 
   bsize = bmax - bmin;
-  bstep = bsize * (1.0 / bins->binSize);
+  bstep = bsize * (1.0f / bins->binSize);
   saTotal = CalculateSurfaceArea(bmin, bmax);
 
-  float invSaTotal = 0.0;
+  float invSaTotal = 0.0f;
   if (saTotal > eps) {
-    invSaTotal = 1.0 / saTotal;
+    invSaTotal = 1.0f / saTotal;
   }
 
   for (int j = 0; j < 3; ++j) {
@@ -915,7 +915,7 @@ bool FindCutFromBinBuffer(float *cutPos,    // [out] xyz
     //     +----+----+----+----+----+
     //
 
-    float minCostPos = bmin[j] + 0.5 * bstep[j];
+    float minCostPos = bmin[j] + 0.5f * bstep[j];
     minCost[j] = std::numeric_limits<float>::max();
 
     left = 0;
@@ -935,7 +935,7 @@ bool FindCutFromBinBuffer(float *cutPos,    // [out] xyz
       // +1 for i since we want a position on right side of the cell.
       //
 
-      pos = bmin[j] + (i + 0.5) * bstep[j];
+      pos = bmin[j] + (i + 0.5f) * bstep[j];
       bmaxLeft[j] = pos;
       bminRight[j] = pos;
 
@@ -1352,7 +1352,7 @@ size_t BVHAccel::BuildTree(BVHBuildStatistics &outStat,
     assert(leftIdx < std::numeric_limits<unsigned int>::max());
 
     leaf.flag = 1; // leaf
-    leaf.data[0] = n;
+    leaf.data[0] = (unsigned int)n;
     leaf.data[1] = (unsigned int)leftIdx;
 
     outNodes.push_back(leaf); // atomic update
@@ -1397,13 +1397,13 @@ size_t BVHAccel::BuildTree(BVHBuildStatistics &outStat,
     mid = std::partition(begin, end,
                          SAHPred(cutAxis, cutPos[cutAxis], vertices, faces));
 
-    midIdx = leftIdx + (mid - begin);
+    midIdx = leftIdx + (unsigned int)(mid - begin);
     if ((midIdx == leftIdx) || (midIdx == rightIdx)) {
 
       // Can't split well.
       // Switch to object median(which may create unoptimized tree, but
       // stable)
-      midIdx = leftIdx + (n >> 1);
+      midIdx = leftIdx + (unsigned int)(n >> 1);
 
       // Try another axis if there's axis to try.
 
@@ -1423,10 +1423,10 @@ size_t BVHAccel::BuildTree(BVHBuildStatistics &outStat,
   unsigned int leftChildIndex = 0;
   unsigned int rightChildIndex = 0;
 
-  leftChildIndex = BuildTree(outStat, outNodes, vertices, faces, leftIdx,
+  leftChildIndex = (unsigned int)BuildTree(outStat, outNodes, vertices, faces, leftIdx,
                              midIdx, depth + 1, epsScale);
 
-  rightChildIndex = BuildTree(outStat, outNodes, vertices, faces, midIdx,
+  rightChildIndex = (unsigned int)BuildTree(outStat, outNodes, vertices, faces, midIdx,
                               rightIdx, depth + 1, epsScale);
 
   {
@@ -1465,7 +1465,7 @@ bool BVHAccel::Build(const float *vertices, const unsigned int *faces,
 #pragma omp parallel for
 #endif
   for (long long i = 0; i < (long long)n; i++) {
-    indices_[i] = i;
+    indices_[i] = (unsigned int)i;
   }
 
   //
@@ -1515,7 +1515,7 @@ bool BVHAccel::Build(const float *vertices, const unsigned int *faces,
     ComputeBoundingBoxOMP(bmin, bmax, vertices, faces, &indices_.at(0), 0, n,
                           epsScale);
 #else
-    ComputeBoundingBox(bmin, bmax, vertices, faces, &indices_.at(0), 0, n,
+    ComputeBoundingBox(bmin, bmax, vertices, faces, &indices_.at(0), 0, (unsigned int)n,
                        epsScale);
 #endif
   }
@@ -1599,7 +1599,7 @@ bool BVHAccel::Build(const float *vertices, const unsigned int *faces,
 #endif
 #else // !_OPENMP
   {
-    BuildTree(stats_, nodes_, vertices, faces, 0, n, /* root depth */ 0,
+    BuildTree(stats_, nodes_, vertices, faces, 0, (unsigned int)n, /* root depth */ 0,
               epsScale); // [0, n)
   }
 #endif
@@ -1745,7 +1745,7 @@ inline bool TriangleIsect(float &tInOut, float &uOut, float &vOut,
     return false;
   }
 
-  invDet = 1.0 / det;
+  invDet = 1.0f / det;
 
   s = rayOrg - p0;
   q = vcross(s, e1);
@@ -1754,11 +1754,11 @@ inline bool TriangleIsect(float &tInOut, float &uOut, float &vOut,
   float v = vdot(q, rayDir) * invDet;
   float t = vdot(e2, q) * invDet;
 
-  if (u < 0.0 || u > 1.0)
+  if (u < 0.0f || u > 1.0f)
     return false;
-  if (v <= 0.0 || u + v > 1.0)
+  if (v <= 0.0f || u + v > 1.0f)
     return false;
-  if (t < 0.0 || t > tInOut)
+  if (t < 0.0f || t > tInOut)
     return false;
 
   tInOut = t;
@@ -1791,7 +1791,7 @@ inline bool TestLeafNode(Intersection &isect, // [inout]
   rayDir[2] = ray.dir[2];
 
   for (unsigned int i = 0; i < numTriangles; i++) {
-    int faceIdx = indices[i + offset];
+    unsigned int faceIdx = indices[i + offset];
 
     if ((faceIdx < traceOptions.faceIdsRange[0]) || (faceIdx >= traceOptions.faceIdsRange[1])) {
       continue;
@@ -1936,9 +1936,9 @@ bool BVHAccel::Traverse(Intersection &isect, const float *vertices,
 
   // @fixme { Check edge case; i.e., 1/0 }
   float3 rayInvDir;
-  rayInvDir[0] = 1.0 / ray.dir[0];
-  rayInvDir[1] = 1.0 / ray.dir[1];
-  rayInvDir[2] = 1.0 / ray.dir[2];
+  rayInvDir[0] = 1.0f / ray.dir[0];
+  rayInvDir[1] = 1.0f / ray.dir[1];
+  rayInvDir[2] = 1.0f / ray.dir[2];
 
   float3 rayOrg;
   rayOrg[0] = ray.org[0];
@@ -2006,9 +2006,9 @@ bool BVHAccel::MultiHitTraverse(StackVector<Intersection, 128> &isects,
 
   // @fixme { Check edge case; i.e., 1/0 }
   float3 rayInvDir;
-  rayInvDir[0] = 1.0 / ray.dir[0];
-  rayInvDir[1] = 1.0 / ray.dir[1];
-  rayInvDir[2] = 1.0 / ray.dir[2];
+  rayInvDir[0] = 1.0f / ray.dir[0];
+  rayInvDir[1] = 1.0f / ray.dir[1];
+  rayInvDir[2] = 1.0f / ray.dir[2];
 
   float3 rayOrg;
   rayOrg[0] = ray.org[0];

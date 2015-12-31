@@ -327,8 +327,8 @@ void TextureSampler::fetch(float *rgba, float u, float v) const {
     return;
   }
 
-  float sx = fasterfloor(u);
-  float sy = fasterfloor(v);
+  float sx = (float)fasterfloor(u);
+  float sy = (float)fasterfloor(v);
 
   float uu = u - sx;
   float vv = v - sy;
@@ -374,7 +374,7 @@ void TextureSampler::fetch(float *rgba, float u, float v) const {
 }
 
 void colorize_material_id(unsigned char col[3], unsigned int mid) {
-  float table[7][3] = {{255, 0, 0},
+  unsigned char table[7][3] = {{255, 0, 0},
                        {0, 0, 255},
                        {0, 255, 0},
                        {255, 0, 255},
@@ -1126,7 +1126,7 @@ static int rtnvg__convertPaint(RTNVGcontext *rt, RTNVGfragUniforms *frag,
     frag->type = NSVG_SHADER_FILLIMG;
 
     if (tex->type == NVG_TEXTURE_RGBA)
-      frag->texType = (tex->flags & NVG_IMAGE_PREMULTIPLIED) ? 0 : 1;
+      frag->texType = (tex->flags & NVG_IMAGE_PREMULTIPLIED) ? 0.0f : 1.0f;
     else
       frag->texType = 2;
     //		printf("frag->texType = %d\n", frag->texType);
@@ -1178,8 +1178,8 @@ static float rtnvg__sdroundrect(float pt[2], float ext[2], float rad) {
   d[1] = fabsf(pt[1]) - ext2[1];
   // printf("d = %f, %f\n", d[0], d[1]);
   float max_d[2];
-  max_d[0] = (d[0] < 0.0) ? 0.0 : d[0];
-  max_d[1] = (d[1] < 0.0) ? 0.0 : d[1];
+  max_d[0] = (d[0] < 0.0f) ? 0.0f : d[0];
+  max_d[1] = (d[1] < 0.0f) ? 0.0f : d[1];
 
   float d_val = (d[0] > d[1]) ? d[0] : d[1];
   d_val = (d_val < 0.0f) ? d_val : 0.0f;
@@ -1192,7 +1192,7 @@ static float rtnvg__sdroundrect(float pt[2], float ext[2], float rad) {
 }
 
 static unsigned char ftouc(float x) {
-  int i = x * 255.0f;
+  int i = (int)(x * 255.0f);
   i = (i < 0) ? 0 : i;
   i = (i > 255) ? 255 : i;
   return (unsigned char)i;
@@ -1459,7 +1459,7 @@ static void rtnvg__fill(RTNVGcontext *rt, RTNVGcall *call) {
     // TRIANGLE_FAN -> TRIANGLES.
     for (int k = 0; k < npaths; k++) {
       int npolys = paths[k].fillCount - 2;
-      int voffset = vertices.size() / 3;
+      int voffset = (int)vertices.size() / 3;
       for (int n = 0; n < npolys; n++) {
         faces.push_back(voffset + 0);
         faces.push_back(voffset + n + 1);
@@ -1490,7 +1490,7 @@ static void rtnvg__fill(RTNVGcontext *rt, RTNVGcall *call) {
 
       nanort::BVHAccel accel;
       bool ret =
-          accel.Build(&vertices.at(0), &faces.at(0), faces.size() / 3, options);
+          accel.Build(&vertices.at(0), &faces.at(0), (unsigned int)faces.size() / 3, options);
       assert(ret);
       (void)ret;
 
@@ -1510,10 +1510,10 @@ static void rtnvg__fill(RTNVGcontext *rt, RTNVGcall *call) {
       // const float tFar = 1.0e+30f;
 
       int bound[4]; // l,t,r,b
-      bound[0] = rt->verts[call->triangleOffset + 0].x - 1;
-      bound[1] = rt->verts[call->triangleOffset + 2].y - 1;
-      bound[2] = rt->verts[call->triangleOffset + 1].x + 1;
-      bound[3] = rt->verts[call->triangleOffset + 0].y + 1;
+      bound[0] = (int)rt->verts[call->triangleOffset + 0].x - 1;
+      bound[1] = (int)rt->verts[call->triangleOffset + 2].y - 1;
+      bound[2] = (int)rt->verts[call->triangleOffset + 1].x + 1;
+      bound[3] = (int)rt->verts[call->triangleOffset + 0].y + 1;
       // printf("drawFill: triangleOffset: %d, triangleCount: %d\n",
       // call->triangleOffset, call->triangleCount);
       // Shoot rays.
@@ -1591,7 +1591,7 @@ static void rtnvg__convexFill(RTNVGcontext *rt, RTNVGcall *call) {
     // TRIANGLE_FAN -> TRIANGLES.
     for (int k = 0; k < npaths; k++) {
       int npolys = paths[k].fillCount - 2;
-      int voffset = vertices.size() / 3;
+      int voffset = (int)vertices.size() / 3;
       for (int n = 0; n < npolys; n++) {
         faces.push_back(voffset + 0);
         faces.push_back(voffset + n + 1);
@@ -1619,7 +1619,7 @@ static void rtnvg__convexFill(RTNVGcontext *rt, RTNVGcall *call) {
 
       nanort::BVHAccel accel;
       bool ret =
-          accel.Build(&vertices.at(0), &faces.at(0), faces.size() / 3, options);
+          accel.Build(&vertices.at(0), &faces.at(0), (unsigned int)faces.size() / 3, options);
       assert(ret);
       (void)ret;
 
@@ -1639,10 +1639,10 @@ static void rtnvg__convexFill(RTNVGcontext *rt, RTNVGcall *call) {
       // const float tFar = 1.0e+30f;
 
       int bound[4]; // l,t,r,b
-      bound[0] = rt->verts[call->triangleOffset + 0].x - 1;
-      bound[1] = rt->verts[call->triangleOffset + 2].y - 1;
-      bound[2] = rt->verts[call->triangleOffset + 1].x + 1;
-      bound[3] = rt->verts[call->triangleOffset + 0].y + 1;
+      bound[0] = (int)rt->verts[call->triangleOffset + 0].x - 1;
+      bound[1] = (int)rt->verts[call->triangleOffset + 2].y - 1;
+      bound[2] = (int)rt->verts[call->triangleOffset + 1].x + 1;
+      bound[3] = (int)rt->verts[call->triangleOffset + 0].y + 1;
       // printf("drawFill: triangleOffset: %d, triangleCount: %d\n",
       // call->triangleOffset, call->triangleCount);
       // Shoot rays.
@@ -1751,7 +1751,7 @@ static void rtnvg__stroke(RTNVGcontext *rt, RTNVGcall *call) {
     // TRIANGLE_STRIP -> TRIANGLES.
     for (int k = 0; k < npaths; k++) {
       int npolys = paths[k].strokeCount - 2;
-      int voffset = vertices.size() / 3;
+      int voffset = (int)vertices.size() / 3;
       for (int n = 0; n < npolys; n++) {
         int n0, n1, n2;
         // flip vertex order for even and odd triangle.
@@ -1793,7 +1793,7 @@ static void rtnvg__stroke(RTNVGcontext *rt, RTNVGcall *call) {
 
       nanort::BVHAccel accel;
       bool ret =
-          accel.Build(&vertices.at(0), &faces.at(0), faces.size() / 3, options);
+          accel.Build(&vertices.at(0), &faces.at(0), (unsigned int)faces.size() / 3, options);
       assert(ret);
       (void)ret;
 
@@ -1880,7 +1880,7 @@ static void rtnvg__triangles(RTNVGcontext *rt, RTNVGcall *call) {
           // Adjust Z index to solve triangle overlapping.
           vertices.push_back(rt->verts[call->triangleOffset + 3 * n + k].x);
           vertices.push_back(rt->verts[call->triangleOffset + 3 * n + k].y);
-          vertices.push_back(-n);
+          vertices.push_back(-(float)n);
 
           texcoords.push_back(rt->verts[call->triangleOffset + 3 * n + k].u);
           texcoords.push_back(rt->verts[call->triangleOffset + 3 * n + k].v);
@@ -1903,7 +1903,7 @@ static void rtnvg__triangles(RTNVGcontext *rt, RTNVGcall *call) {
 
       nanort::BVHAccel accel;
       bool ret =
-          accel.Build(&vertices.at(0), &faces.at(0), faces.size() / 3, options);
+          accel.Build(&vertices.at(0), &faces.at(0), (unsigned int)faces.size() / 3, options);
       assert(ret);
       (void)ret;
 
@@ -1968,10 +1968,10 @@ static void rtnvg__triangles(RTNVGcontext *rt, RTNVGcall *call) {
                   int f0 = faces[3 * isects[i].faceID + 0];
                   int f1 = faces[3 * isects[i].faceID + 1];
                   int f2 = faces[3 * isects[i].faceID + 2];
-                  float tu = (1.0 - U - V) * texcoords[2 * f0 + 0] +
+                  float tu = (1.0f - U - V) * texcoords[2 * f0 + 0] +
                              U * texcoords[2 * f1 + 0] +
                              V * texcoords[2 * f2 + 0];
-                  float tv = (1.0 - U - V) * texcoords[2 * f0 + 1] +
+                  float tv = (1.0f - U - V) * texcoords[2 * f0 + 1] +
                              U * texcoords[2 * f1 + 1] +
                              V * texcoords[2 * f2 + 1];
                   RTNVGfragUniforms *frag =

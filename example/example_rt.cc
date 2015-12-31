@@ -38,7 +38,7 @@ int main() {
 
   nvgBeginFrame(vg, winWidth, winHeight, pxRatio);
 
-  renderDemo(vg, 0, 0, winWidth, winHeight, 15.0f, 0, &data);
+  renderDemo(vg, 0, 0, winWidth, winHeight, 15.0f, 0.0f, &data);
 
   nvgEndFrame(vg);
 
