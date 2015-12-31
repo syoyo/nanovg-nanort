@@ -3,9 +3,10 @@
 ![](images/render.png)
 
 `nanovg-nanort` is a CPU backend using software ray tracer(NanoRT) for Mikko Mononen’s awesome vector graphics renderer NanoVG(https://github.com/memononen/nanovg). 
-`nanovg-nanort` does not require OpenGL environment, thus can draw vector graphics in various environment(e.g. server-side, no-GPU/no-OpenGL machine, virtual machine environment, etc).
 
-In contrast to OpenGL backend for `NanoVG`, `nanovg-nanort` requires C++ compiler.
+`nanovg-nanort` does not require OpenGL environment, thus it can draw vector graphics in various environment(e.g. server-side, no-GPU/no-OpenGL machine, virtual machine environment, etc).
+
+In contrast to default OpenGL backend for `NanoVG`, `nanovg-nanort` requires C++(C++-98 + STL) compiler.
 
 ## How to use.
 
@@ -26,7 +27,7 @@ int winWidth = 1024;
 int winHeight = 1024;
 float pxRatio = 1.0f;
 
-vg = nvgCreateRT(NVG_STENCIL_STROKES | NVG_DEBUG, winWidth, winHeight);
+vg = nvgCreateRT(NVG_DEBUG, winWidth, winHeight);
 if (vg == NULL) {
 	printf("Could not init nanovg.\n");
 	return -1;

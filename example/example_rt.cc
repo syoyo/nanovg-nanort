@@ -43,7 +43,7 @@ int main()
   int winWidth = 1024;
   int winHeight = 1024;
 
-	vg = nvgCreateRT(NVG_STENCIL_STROKES | NVG_DEBUG, winWidth, winHeight);
+	vg = nvgCreateRT(NVG_DEBUG, winWidth, winHeight);
 	if (vg == NULL) {
 		printf("Could not init nanovg.\n");
 		return -1;
