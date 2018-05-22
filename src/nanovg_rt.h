@@ -1518,7 +1518,14 @@ static void rtnvg__fill(RTNVGcontext *rt, RTNVGcall *call) {
       // call->triangleOffset, call->triangleCount);
       // Shoot rays.
       for (int y = bound[1]; y < bound[3]; y++) {
+        // bound check
+        if (y < 0) continue;
+        if (y >= rt->height) continue; 
         for (int x = bound[0]; x < bound[2]; x++) {
+          // bound check
+          if (x < 0) continue;
+          if (x >= rt->width) continue; 
+
           // Use multi-hit ray traversal to detect overdraw.
           nanort::StackVector<nanort::Intersection, 128> isects;
           int maxIsects = 128;
@@ -1647,7 +1654,13 @@ static void rtnvg__convexFill(RTNVGcontext *rt, RTNVGcall *call) {
       // call->triangleOffset, call->triangleCount);
       // Shoot rays.
       for (int y = bound[1]; y < bound[3]; y++) {
+        // bound check
+        if (y < 0) continue;
+        if (y >= rt->height) continue;
         for (int x = bound[0]; x < bound[2]; x++) {
+          // bound check
+          if (x < 0) continue;
+          if (x >= rt->width) continue;
 
           // Use multi-hit ray traversal to detect overdraw.
           nanort::StackVector<nanort::Intersection, 128> isects;
