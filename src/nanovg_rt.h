@@ -1514,6 +1514,10 @@ static void rtnvg__fill(RTNVGcontext *rt, RTNVGcall *call) {
       bound[1] = (int)rt->verts[call->triangleOffset + 2].y - 1;
       bound[2] = (int)rt->verts[call->triangleOffset + 1].x + 1;
       bound[3] = (int)rt->verts[call->triangleOffset + 0].y + 1;
+      if (bound[0] < 0)           bound[0] = 0;
+      if (bound[1] < 0)           bound[1] = 0;
+      if (bound[2] >= rt->width)  bound[2] = rt->width  - 1;
+      if (bound[3] >= rt->height) bound[3] = rt->height - 1;
       // printf("drawFill: triangleOffset: %d, triangleCount: %d\n",
       // call->triangleOffset, call->triangleCount);
       // Shoot rays.
@@ -1650,6 +1654,10 @@ static void rtnvg__convexFill(RTNVGcontext *rt, RTNVGcall *call) {
       bound[1] = (int)rt->verts[call->triangleOffset + 2].y - 1;
       bound[2] = (int)rt->verts[call->triangleOffset + 1].x + 1;
       bound[3] = (int)rt->verts[call->triangleOffset + 0].y + 1;
+      if (bound[0] < 0)           bound[0] = 0;
+      if (bound[1] < 0)           bound[1] = 0;
+      if (bound[2] >= rt->width)  bound[2] = rt->width - 1;
+      if (bound[3] >= rt->height) bound[3] = rt->height - 1;
       // printf("drawFill: triangleOffset: %d, triangleCount: %d\n",
       // call->triangleOffset, call->triangleCount);
       // Shoot rays.
@@ -1828,6 +1836,10 @@ static void rtnvg__stroke(RTNVGcontext *rt, RTNVGcall *call) {
       bound[1] = (int)bmin[1] - 1;
       bound[2] = (int)bmax[0] + 1;
       bound[3] = (int)bmax[1] + 1;
+      if (bound[0] < 0)           bound[0] = 0;
+      if (bound[1] < 0)           bound[1] = 0;
+      if (bound[2] >= rt->width)  bound[2] = rt->width - 1;
+      if (bound[3] >= rt->height) bound[3] = rt->height - 1;
       // Shoot rays.
       for (int y = bound[1]; y < bound[3]; y++) {
         for (int x = bound[0]; x < bound[2]; x++) {
@@ -1938,6 +1950,10 @@ static void rtnvg__triangles(RTNVGcontext *rt, RTNVGcall *call) {
       bound[1] = (int)bmin[1] - 1;
       bound[2] = (int)bmax[0] + 1;
       bound[3] = (int)bmax[1] + 1;
+      if (bound[0] < 0)           bound[0] = 0;
+      if (bound[1] < 0)           bound[1] = 0;
+      if (bound[2] >= rt->width)  bound[2] = rt->width - 1;
+      if (bound[3] >= rt->height) bound[3] = rt->height - 1;
       // Shoot rays.
       for (int y = bound[1]; y < bound[3]; y++) {
         for (int x = bound[0]; x < bound[2]; x++) {
