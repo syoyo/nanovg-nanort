@@ -2,7 +2,7 @@
 
 ![](images/render.png)
 
-`nanovg-nanort` is a CPU backend using software ray tracer(NanoRT) for Mikko Mononen’s awesome vector graphics renderer NanoVG(https://github.com/memononen/nanovg). 
+`nanovg-nanort` is a CPU backend using software ray tracer(NanoRT) for Mikko Mononen’s awesome vector graphics renderer NanoVG(https://github.com/memononen/nanovg).
 
 `nanovg-nanort` does not require OpenGL environment, thus it can draw vector graphics in various environment(e.g. server-side, no-GPU/no-OpenGL machine, virtual machine environment, etc).
 
@@ -52,6 +52,7 @@ nvgDeleteRT(vg);
 ## TODO
 
 * [ ] Anti-alasing.
+* [ ] compositeOperation
 * [ ] Robust alpha-blending.
 * [ ] Premultiplied alpha validation.
 * [ ] Optimization.

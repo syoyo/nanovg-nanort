@@ -582,7 +582,7 @@ static void rtnvg__stencilFunc(RTNVGcontext* rt, int func, int ref, unsigned int
 	if ((rt->stencilFunc != func) ||
 		(rt->stencilFuncRef != ref) ||
 		(rt->stencilFuncMask != mask)) {
-		
+
 		rt->stencilFunc = func;
 		rt->stencilFuncRef = ref;
 		rt->stencilFuncMask = mask;
@@ -1163,10 +1163,11 @@ static void rtnvg__setUniforms(RTNVGcontext *rt, int uniformOffset, int image) {
   }
 }
 
-static void rtnvg__renderViewport(void *uptr, int width, int height) {
+static void rtnvg__renderViewport(void *uptr, float width, float height, float devicePixelRatio) {
+  (void)devicePixelRatio;
   RTNVGcontext *rt = (RTNVGcontext *)uptr;
-  rt->view[0] = (float)width;
-  rt->view[1] = (float)height;
+  rt->view[0] = width;
+  rt->view[1] = height;
 }
 
 static float rtnvg__sdroundrect(float pt[2], float ext[2], float rad) {
@@ -1524,11 +1525,11 @@ static void rtnvg__fill(RTNVGcontext *rt, RTNVGcall *call) {
       for (int y = bound[1]; y < bound[3]; y++) {
         // bound check
         if (y < 0) continue;
-        if (y >= rt->height) continue; 
+        if (y >= rt->height) continue;
         for (int x = bound[0]; x < bound[2]; x++) {
           // bound check
           if (x < 0) continue;
-          if (x >= rt->width) continue; 
+          if (x >= rt->width) continue;
 
           // Use multi-hit ray traversal to detect overdraw.
           nanort::StackVector<nanort::Intersection, 128> isects;
@@ -2156,7 +2157,7 @@ static void rtnvg__vset(NVGvertex *vtx, float x, float y, float u, float v) {
   vtx->v = v;
 }
 
-static void rtnvg__renderFill(void *uptr, NVGpaint *paint, NVGscissor *scissor,
+static void rtnvg__renderFill(void *uptr, NVGpaint *paint, NVGcompositeOperationState compositeOperation, NVGscissor *scissor,
                               float fringe, const float *bounds,
                               const NVGpath *paths, int npaths) {
   // printf("__renderFill\n");
@@ -2175,6 +2176,9 @@ static void rtnvg__renderFill(void *uptr, NVGpaint *paint, NVGscissor *scissor,
     goto error;
   call->pathCount = npaths;
   call->image = paint->image;
+  // TODO(syoyo): Implement
+  // call->blendFunc = glnvg_blendCompositeOperation(compositeOperation)
+  (void)compositeOperation;
 
   // printf("pathOffset = %d\n", call->pathOffset);
 
@@ -2261,6 +2265,7 @@ error:
 }
 
 static void rtnvg__renderStroke(void *uptr, NVGpaint *paint,
+                                NVGcompositeOperationState compositeOperation,
                                 NVGscissor *scissor, float fringe,
                                 float strokeWidth, const NVGpath *paths,
                                 int npaths) {
@@ -2278,6 +2283,9 @@ static void rtnvg__renderStroke(void *uptr, NVGpaint *paint,
     goto error;
   call->pathCount = npaths;
   call->image = paint->image;
+  // TODO(syoyo): Implement
+  // call->blendFunc = glnvg_blendCompositeOperation(compositeOperation)
+  (void)compositeOperation;
 
   // Allocate vertices for all the paths.
   maxverts = rtnvg__maxVertCount(paths, npaths);
@@ -2329,6 +2337,7 @@ error:
 }
 
 static void rtnvg__renderTriangles(void *uptr, NVGpaint *paint,
+                                   NVGcompositeOperationState compositeOperation,
                                    NVGscissor *scissor, const NVGvertex *verts,
                                    int nverts) {
   // printf("renderTriangles\n");
@@ -2341,6 +2350,9 @@ static void rtnvg__renderTriangles(void *uptr, NVGpaint *paint,
 
   call->type = RTNVG_TRIANGLES;
   call->image = paint->image;
+  // TODO(syoyo): Implement
+  // call->blendFunc = glnvg_blendCompositeOperation(compositeOperation)
+  (void)compositeOperation;
 
   // Allocate vertices for all the paths.
   call->triangleOffset = rtnvg__allocVerts(rt, nverts);
