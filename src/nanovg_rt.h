@@ -64,6 +64,8 @@ enum NVGcreateFlags {
 NVGcontext *nvgCreateRT(int flags, int w, int h);
 void nvgDeleteRT(NVGcontext *ctx);
 void nvgClearBackgroundRT(NVGcontext *ctx, float r, float g, float b, float a); // Clear background.
+void nvgReszieFramebufferRT(NVGcontext *ctxt, int w, int h);
+void nvgQueryFramebufferRT(NVGcontext *ctxt,int *w, int *h, unsigned char **fb);
 unsigned char *nvgReadPixelsRT(NVGcontext *ctx); // Returns RGBA8 pixel data.
 
 // These are additional flags on top of NVGimageFlags.
@@ -71,9 +73,9 @@ enum NVGimageFlagsRT {
   NVG_IMAGE_NODELETE = 1 << 16, // Do not delete RT texture handle.
 };
 
-int nvrtCreateImageFromHandle(NVGcontext *ctx, unsigned int textureId, int w,
+int nvrtCreateImageFromHandle(NVGcontext *ctx, unsigned char *tex_data, int w,
                               int h, int flags);
-unsigned int nvrtImageHandle(NVGcontext *ctx, int image);
+unsigned char *nvrtImageHandle(NVGcontext *ctx, int image);
 
 #ifdef __cplusplus
 }
@@ -637,8 +639,7 @@ static int rtnvg__deleteTexture(RTNVGcontext *rt, int id) {
   int i;
   for (i = 0; i < rt->ntextures; i++) {
     if (rt->textures[i].id == id) {
-      if (rt->textures[i].tex != 0 &&
-          (rt->textures[i].flags & NVG_IMAGE_NODELETE) == 0) {
+      if ((rt->textures[i].flags & NVG_IMAGE_NODELETE) == 0) {
         free(rt->textures[i].data);
         // glDeleteTextures(1, &rt->textures[i].tex);
       }
@@ -760,182 +761,7 @@ static void rtnvg__getUniforms(RTNVGshader *shader) {
 static int rtnvg__renderCreate(void *uptr) {
   RTNVGcontext *rt = (RTNVGcontext *)uptr;
   int align = 4;
-
-  // TODO: mediump float may not be enough for GLES2 in iOS.
-  // see the following discussion: https://github.com/memononen/nanovg/issues/46
-  static const char *shaderHeader = "#version 100\n"
-                                    "#define NANOVG_GL2 1\n"
-
-#if NANOVG_GL_USE_UNIFORMBUFFER
-                                    "#define USE_UNIFORMBUFFER 1\n"
-#else
-                                    "#define UNIFORMARRAY_SIZE 11\n"
-#endif
-                                    "\n";
-
-  static const char *fillVertShader =
-      "#ifdef NANOVG_GL3\n"
-      "	uniform vec2 viewSize;\n"
-      "	in vec2 vertex;\n"
-      "	in vec2 tcoord;\n"
-      "	out vec2 ftcoord;\n"
-      "	out vec2 fpos;\n"
-      "#else\n"
-      "	uniform vec2 viewSize;\n"
-      "	attribute vec2 vertex;\n"
-      "	attribute vec2 tcoord;\n"
-      "	varying vec2 ftcoord;\n"
-      "	varying vec2 fpos;\n"
-      "#endif\n"
-      "void main(void) {\n"
-      "	ftcoord = tcoord;\n"
-      "	fpos = vertex;\n"
-      "	gl_Position = vec4(2.0*vertex.x/viewSize.x - 1.0, 1.0 - "
-      "2.0*vertex.y/viewSize.y, 0, 1);\n"
-      "}\n";
-
-  static const char *fillFragShader =
-      "#ifdef GL_ES\n"
-      "#if defined(GL_FRAGMENT_PRECISION_HIGH) || defined(NANOVG_GL3)\n"
-      " precision highp float;\n"
-      "#else\n"
-      " precision mediump float;\n"
-      "#endif\n"
-      "#endif\n"
-      "#ifdef NANOVG_GL3\n"
-      "#ifdef USE_UNIFORMBUFFER\n"
-      "	layout(std140) uniform frag {\n"
-      "		mat3 scissorMat;\n"
-      "		mat3 paintMat;\n"
-      "		vec4 innerCol;\n"
-      "		vec4 outerCol;\n"
-      "		vec2 scissorExt;\n"
-      "		vec2 scissorScale;\n"
-      "		vec2 extent;\n"
-      "		float radius;\n"
-      "		float feather;\n"
-      "		float strokeMult;\n"
-      "		float strokeThr;\n"
-      "		int texType;\n"
-      "		int type;\n"
-      "	};\n"
-      "#else\n" // NANOVG_GL3 && !USE_UNIFORMBUFFER
-      "	uniform vec4 frag[UNIFORMARRAY_SIZE];\n"
-      "#endif\n"
-      "	uniform sampler2D tex;\n"
-      "	in vec2 ftcoord;\n"
-      "	in vec2 fpos;\n"
-      "	out vec4 outColor;\n"
-      "#else\n" // !NANOVG_GL3
-      "	uniform vec4 frag[UNIFORMARRAY_SIZE];\n"
-      "	uniform sampler2D tex;\n"
-      "	varying vec2 ftcoord;\n"
-      "	varying vec2 fpos;\n"
-      "#endif\n"
-      "#ifndef USE_UNIFORMBUFFER\n"
-      "	#define scissorMat mat3(frag[0].xyz, frag[1].xyz, frag[2].xyz)\n"
-      "	#define paintMat mat3(frag[3].xyz, frag[4].xyz, frag[5].xyz)\n"
-      "	#define innerCol frag[6]\n"
-      "	#define outerCol frag[7]\n"
-      "	#define scissorExt frag[8].xy\n"
-      "	#define scissorScale frag[8].zw\n"
-      "	#define extent frag[9].xy\n"
-      "	#define radius frag[9].z\n"
-      "	#define feather frag[9].w\n"
-      "	#define strokeMult frag[10].x\n"
-      "	#define strokeThr frag[10].y\n"
-      "	#define texType int(frag[10].z)\n"
-      "	#define type int(frag[10].w)\n"
-      "#endif\n"
-      "\n"
-      "float sdroundrect(vec2 pt, vec2 ext, float rad) {\n"
-      "	vec2 ext2 = ext - vec2(rad,rad);\n"
-      "	vec2 d = abs(pt) - ext2;\n"
-      "	return min(max(d.x,d.y),0.0) + length(max(d,0.0)) - rad;\n"
-      "}\n"
-      "\n"
-      "// Scissoring\n"
-      "float scissorMask(vec2 p) {\n"
-      "	vec2 sc = (abs((scissorMat * vec3(p,1.0)).xy) - scissorExt);\n"
-      "	sc = vec2(0.5,0.5) - sc * scissorScale;\n"
-      "	return clamp(sc.x,0.0,1.0) * clamp(sc.y,0.0,1.0);\n"
-      "}\n"
-      "#ifdef EDGE_AA\n"
-      "// Stroke - from [0..1] to clipped pyramid, where the slope is 1px.\n"
-      "float strokeMask() {\n"
-      "	return min(1.0, (1.0-abs(ftcoord.x*2.0-1.0))*strokeMult) * min(1.0, "
-      "ftcoord.y);\n"
-      "}\n"
-      "#endif\n"
-      "\n"
-      "void main(void) {\n"
-      "   vec4 result;\n"
-      "	float scissor = scissorMask(fpos);\n"
-      "#ifdef EDGE_AA\n"
-      "	float strokeAlpha = strokeMask();\n"
-      "#else\n"
-      "	float strokeAlpha = 1.0;\n"
-      "#endif\n"
-      "	if (type == 0) {			// Gradient\n"
-      "		// Calculate gradient color using box gradient\n"
-      "		vec2 pt = (paintMat * vec3(fpos,1.0)).xy;\n"
-      "		float d = clamp((sdroundrect(pt, extent, radius) + feather*0.5) / "
-      "feather, 0.0, 1.0);\n"
-      "		vec4 color = mix(innerCol,outerCol,d);\n"
-      "		// Combine alpha\n"
-      "		color *= strokeAlpha * scissor;\n"
-      "		result = color;\n"
-      "	} else if (type == 1) {		// Image\n"
-      "		// Calculate color fron texture\n"
-      "		vec2 pt = (paintMat * vec3(fpos,1.0)).xy / extent;\n"
-      "#ifdef NANOVG_GL3\n"
-      "		vec4 color = texture(tex, pt);\n"
-      "#else\n"
-      "		vec4 color = texture2D(tex, pt);\n"
-      "#endif\n"
-      "		if (texType == 1) color = vec4(color.xyz*color.w,color.w);"
-      "		if (texType == 2) color = vec4(color.x);"
-      "		// Apply color tint and alpha.\n"
-      "		color *= innerCol;\n"
-      "		// Combine alpha\n"
-      "		color *= strokeAlpha * scissor;\n"
-      "		result = color;\n"
-      "	} else if (type == 2) {		// Stencil fill\n"
-      "		result = vec4(1,1,1,1);\n"
-      "	} else if (type == 3) {		// Textured tris\n"
-      "#ifdef NANOVG_GL3\n"
-      "		vec4 color = texture(tex, ftcoord);\n"
-      "#else\n"
-      "		vec4 color = texture2D(tex, ftcoord);\n"
-      "#endif\n"
-      "		if (texType == 1) color = vec4(color.xyz*color.w,color.w);"
-      "		if (texType == 2) color = vec4(color.x);"
-      "		color *= scissor;\n"
-      "		result = color * innerCol;\n"
-      "	}\n"
-      "#ifdef EDGE_AA\n"
-      "	if (strokeAlpha < strokeThr) discard;\n"
-      "#endif\n"
-      "#ifdef NANOVG_GL3\n"
-      "	outColor = result;\n"
-      "#else\n"
-      "	gl_FragColor = result;\n"
-      "#endif\n"
-      "}\n";
-
-  rtnvg__checkError(rt, "init");
-
-  if (rt->flags & NVG_ANTIALIAS) {
-    if (rtnvg__createShader(&rt->shader, "shader", shaderHeader,
-                            "#define EDGE_AA 1\n", fillVertShader,
-                            fillFragShader) == 0)
-      return 0;
-  } else {
-    if (rtnvg__createShader(&rt->shader, "shader", shaderHeader, NULL,
-                            fillVertShader, fillFragShader) == 0)
-      return 0;
-  }
-
+  
   rtnvg__checkError(rt, "uniform locations");
   rtnvg__getUniforms(&rt->shader);
 
@@ -2339,7 +2165,7 @@ error:
 static void rtnvg__renderTriangles(void *uptr, NVGpaint *paint,
                                    NVGcompositeOperationState compositeOperation,
                                    NVGscissor *scissor, const NVGvertex *verts,
-                                   int nverts) {
+                                   int nverts, float fringe) {
   // printf("renderTriangles\n");
   RTNVGcontext *rt = (RTNVGcontext *)uptr;
   RTNVGcall *call = rtnvg__allocCall(rt);
@@ -2367,7 +2193,7 @@ static void rtnvg__renderTriangles(void *uptr, NVGpaint *paint,
   if (call->uniformOffset == -1)
     goto error;
   frag = nvg__fragUniformPtr(rt, call->uniformOffset);
-  rtnvg__convertPaint(rt, frag, paint, scissor, 1.0f, 1.0f, -1.0f);
+  rtnvg__convertPaint(rt, frag, paint, scissor, 1.0f, fringe, -1.0f);
   frag->type = NSVG_SHADER_IMG;
 
   return;
@@ -2463,18 +2289,20 @@ void nvgDeleteRT(NVGcontext *ctx) {
   nvgDeleteInternal(ctx);
 }
 
-int nvglCreateImageFromHandle(NVGcontext *ctx, unsigned int textureId, int w,
+int nvglCreateImageFromHandle(NVGcontext *ctx, unsigned char *tex_data, int w,
                               int h, int imageFlags) {
+
+  if(tex_data == NULL){
+    return -1;
+  }
   RTNVGcontext *rt = (RTNVGcontext *)nvgInternalParams(ctx)->userPtr;
   RTNVGtexture *tex = rtnvg__allocTexture(rt);
 
-  printf("Not supported.\n");
-  exit(-1);
   if (tex == NULL)
-    return 0;
-
+    return -1;
+  tex->data = tex_data;
   tex->type = NVG_TEXTURE_RGBA;
-  tex->tex = textureId;
+  tex->tex = 0;
   tex->flags = imageFlags;
   tex->width = w;
   tex->height = h;
@@ -2482,10 +2310,10 @@ int nvglCreateImageFromHandle(NVGcontext *ctx, unsigned int textureId, int w,
   return tex->id;
 }
 
-unsigned int nvglImageHandle(NVGcontext *ctx, int image) {
+unsigned char *nvglImageHandle(NVGcontext *ctx, int image) {
   RTNVGcontext *rt = (RTNVGcontext *)nvgInternalParams(ctx)->userPtr;
   RTNVGtexture *tex = rtnvg__findTexture(rt, image);
-  return tex->tex;
+  return tex->data;
 }
 
 void nvgClearBackgroundRT(NVGcontext *ctx, float r, float g, float b, float a) {
@@ -2506,5 +2334,22 @@ unsigned char *nvgReadPixelsRT(NVGcontext *ctx) {
   RTNVGcontext *rt = (RTNVGcontext *)nvgInternalParams(ctx)->userPtr;
   return rt->pixels;
 }
-
+void nvgResizeFramebufferRT(NVGcontext *ctx,int w,int h){
+  RTNVGcontext *rt = (RTNVGcontext *)nvgInternalParams(ctx)->userPtr;
+  rt->pixels = (unsigned char*)realloc(rt->pixels,w * h * 4);
+  rt->width = w;
+  rt->height = h;
+}
+void nvgQueryFramebufferRT(NVGcontext *ctx,int *w, int *h, unsigned char **fb){
+  RTNVGcontext *rt = (RTNVGcontext *)nvgInternalParams(ctx)->userPtr;
+  if(w != NULL){
+    *w = rt->width;
+  }
+  if(h != NULL){
+    *h = rt->height;
+  }
+  if(fb != NULL){
+    *fb = rt->pixels;
+  }
+}
 #endif /* NANOVG_RT_IMPLEMENTATION */

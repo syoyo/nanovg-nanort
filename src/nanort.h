@@ -2,10 +2,16 @@
 // NanoRT, single header only modern ray tracing kernel.
 //
 
+//
+// Notes : The number of primitives are up to 2G. If you want to render large
+// data, please split data into chunks(~ 2G prims) and use NanoSG scene graph
+// library(`${nanort}/examples/nanosg`).
+//
+
 /*
 The MIT License (MIT)
 
-Copyright (c) 2015 Light Transport Entertainment, Inc.
+Copyright (c) 2015 - 2019 Light Transport Entertainment, Inc.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -26,23 +32,75 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 */
 
-#ifndef __NANORT_H__
-#define __NANORT_H__
+#ifndef NANORT_H_
+#define NANORT_H_
 
-#include <vector>
-#include <queue>
+#include <algorithm>
+#include <cassert>
 #include <cmath>
-#include <limits>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
+#include <limits>
+#include <memory>
+#include <queue>
 #include <string>
+#include <vector>
+
+// compiler macros
+//
+// NANORT_USE_CPP11_FEATURE : Enable C++11 feature
+// NANORT_ENABLE_PARALLEL_BUILD : Enable parallel BVH build.
+// NANORT_ENABLE_SERIALIZATION : Enable serialization feature for built BVH.
+//
+// Parallelized BVH build is supported on C++11 thread version.
+// OpenMP version is not fully tested.
+// thus turn off if you face a problem when building BVH in parallel.
+// #define NANORT_ENABLE_PARALLEL_BUILD
+
+// Some constants
+#define kNANORT_MAX_STACK_DEPTH (512)
+#define kNANORT_MIN_PRIMITIVES_FOR_PARALLEL_BUILD (1024 * 8)
+#define kNANORT_SHALLOW_DEPTH (4)  // will create 2**N subtrees
+
+#ifdef NANORT_USE_CPP11_FEATURE
+// Assume C++11 compiler has thread support.
+// In some situation (e.g. embedded system, JIT compilation), thread feature
+// may not be available though...
+#include <atomic>
+#include <mutex>
+#include <thread>
+
+#define kNANORT_MAX_THREADS (256)
+
+// Parallel build should work well for C++11 version, thus force enable it.
+#ifndef NANORT_ENABLE_PARALLEL_BUILD
+#define NANORT_ENABLE_PARALLEL_BUILD
+#endif
+
+#endif
 
 namespace nanort {
 
-// Parallelized BVH build is not yet fully tested,
-// thus turn off if you face a problem when building BVH.
-#define NANORT_ENABLE_PARALLEL_BUILD (0)
+// RayType
+typedef enum {
+  RAY_TYPE_NONE = 0x0,
+  RAY_TYPE_PRIMARY = 0x1,
+  RAY_TYPE_SECONDARY = 0x2,
+  RAY_TYPE_DIFFUSE = 0x4,
+  RAY_TYPE_REFLECTION = 0x8,
+  RAY_TYPE_REFRACTION = 0x10
+} RayType;
 
+#ifdef __clang__
+#pragma clang diagnostic push
+#if __has_warning("-Wzero-as-null-pointer-constant")
+#pragma clang diagnostic ignored "-Wzero-as-null-pointer-constant"
+#endif
+#endif
+
+// ----------------------------------------------------------------------------
 // Small vector class useful for multi-threaded environment.
 //
 // stack_container.h
@@ -50,8 +108,6 @@ namespace nanort {
 // Copyright (c) 2006-2008 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
-
-//#include "base/basictypes.h"
 
 // This allocator can be used with STL containers to provide a stack buffer
 // from which to allocate memory and overflows onto the heap. This stack buffer
@@ -73,7 +129,7 @@ namespace nanort {
 // buffer.
 template <typename T, size_t stack_capacity>
 class StackAllocator : public std::allocator<T> {
-public:
+ public:
   typedef typename std::allocator<T>::pointer pointer;
   typedef typename std::allocator<T>::size_type size_type;
 
@@ -107,7 +163,8 @@ public:
   };
 
   // Used by containers when they want to refer to an allocator of type U.
-  template <typename U> struct rebind {
+  template <typename U>
+  struct rebind {
     typedef StackAllocator<U, stack_capacity> other;
   };
 
@@ -122,11 +179,13 @@ public:
   // For this constructor, we cannot share storage; there's
   // no guarantee that the Source buffer of Ts is large enough
   // for Us.
-  // TODO: If we were fancy pants, perhaps we could share storage
+  // TODO(Google): If we were fancy pants, perhaps we could share storage
   // iff sizeof(T) == sizeof(U).
   template <typename U, size_t other_capacity>
   StackAllocator(const StackAllocator<U, other_capacity> &other)
-      : source_(NULL) {}
+      : source_(NULL) {
+    (void)other;
+  }
 
   explicit StackAllocator(Source *source) : source_(source) {}
 
@@ -152,7 +211,7 @@ public:
       std::allocator<T>::deallocate(p, n);
   }
 
-private:
+ private:
   Source *source_;
 };
 
@@ -164,8 +223,9 @@ private:
 // WATCH OUT: the ContainerType MUST use the proper StackAllocator for this
 // type. This object is really intended to be used only internally. You'll want
 // to use the wrappers below for different types.
-template <typename TContainerType, int stack_capacity> class StackContainer {
-public:
+template <typename TContainerType, int stack_capacity>
+class StackContainer {
+ public:
   typedef TContainerType ContainerType;
   typedef typename ContainerType::value_type ContainedType;
   typedef StackAllocator<ContainedType, stack_capacity> Allocator;
@@ -198,53 +258,15 @@ public:
   const typename Allocator::Source &stack_data() const { return stack_data_; }
 #endif
 
-protected:
+ protected:
   typename Allocator::Source stack_data_;
+  unsigned char pad_[7];
   Allocator allocator_;
   ContainerType container_;
 
   // DISALLOW_EVIL_CONSTRUCTORS(StackContainer);
   StackContainer(const StackContainer &);
   void operator=(const StackContainer &);
-};
-
-// StackString
-template <size_t stack_capacity>
-class StackString
-    : public StackContainer<
-          std::basic_string<char, std::char_traits<char>,
-                            StackAllocator<char, stack_capacity> >,
-          stack_capacity> {
-public:
-  StackString()
-      : StackContainer<std::basic_string<char, std::char_traits<char>,
-                                         StackAllocator<char, stack_capacity> >,
-                       stack_capacity>() {}
-
-private:
-  // DISALLOW_EVIL_CONSTRUCTORS(StackString);
-  StackString(const StackString &);
-  void operator=(const StackString &);
-};
-
-// StackWString
-template <size_t stack_capacity>
-class StackWString
-    : public StackContainer<
-          std::basic_string<wchar_t, std::char_traits<wchar_t>,
-                            StackAllocator<wchar_t, stack_capacity> >,
-          stack_capacity> {
-public:
-  StackWString()
-      : StackContainer<
-            std::basic_string<wchar_t, std::char_traits<wchar_t>,
-                              StackAllocator<wchar_t, stack_capacity> >,
-            stack_capacity>() {}
-
-private:
-  // DISALLOW_EVIL_CONSTRUCTORS(StackWString);
-  StackWString(const StackWString &);
-  void operator=(const StackWString &);
 };
 
 // StackVector
@@ -257,7 +279,7 @@ template <typename T, size_t stack_capacity>
 class StackVector
     : public StackContainer<std::vector<T, StackAllocator<T, stack_capacity> >,
                             stack_capacity> {
-public:
+ public:
   StackVector()
       : StackContainer<std::vector<T, StackAllocator<T, stack_capacity> >,
                        stack_capacity>() {}
@@ -272,8 +294,8 @@ public:
     this->container().assign(other->begin(), other->end());
   }
 
-  StackVector<T, stack_capacity> &
-  operator=(const StackVector<T, stack_capacity> &other) {
+  StackVector<T, stack_capacity> &operator=(
+      const StackVector<T, stack_capacity> &other) {
     this->container().assign(other->begin(), other->end());
     return *this;
   }
@@ -286,102 +308,227 @@ public:
   }
 };
 
-namespace {
+// ----------------------------------------------------------------------------
 
-struct float3 {
-  float3() {}
-  float3(float xx, float yy, float zz) {
-    x = xx;
-    y = yy;
-    z = zz;
+template <typename T = float>
+class real3 {
+ public:
+  real3() {}
+  real3(T x) {
+    v[0] = x;
+    v[1] = x;
+    v[2] = x;
   }
-  float3(const float *p) {
-    x = p[0];
-    y = p[1];
-    z = p[2];
+  real3(T xx, T yy, T zz) {
+    v[0] = xx;
+    v[1] = yy;
+    v[2] = zz;
+  }
+  explicit real3(const T *p) {
+    v[0] = p[0];
+    v[1] = p[1];
+    v[2] = p[2];
   }
 
-  float3 operator*(float f) const { return float3(x * f, y * f, z * f); }
-  float3 operator-(const float3 &f2) const {
-    return float3(x - f2.x, y - f2.y, z - f2.z);
+  inline T x() const { return v[0]; }
+  inline T y() const { return v[1]; }
+  inline T z() const { return v[2]; }
+
+  real3 operator*(T f) const { return real3(x() * f, y() * f, z() * f); }
+  real3 operator-(const real3 &f2) const {
+    return real3(x() - f2.x(), y() - f2.y(), z() - f2.z());
   }
-  float3 operator*(const float3 &f2) const {
-    return float3(x * f2.x, y * f2.y, z * f2.z);
+  real3 operator*(const real3 &f2) const {
+    return real3(x() * f2.x(), y() * f2.y(), z() * f2.z());
   }
-  float3 operator+(const float3 &f2) const {
-    return float3(x + f2.x, y + f2.y, z + f2.z);
+  real3 operator+(const real3 &f2) const {
+    return real3(x() + f2.x(), y() + f2.y(), z() + f2.z());
   }
-  float3 &operator+=(const float3 &f2) {
-    x += f2.x;
-    y += f2.y;
-    z += f2.z;
+  real3 &operator+=(const real3 &f2) {
+    v[0] += f2.x();
+    v[1] += f2.y();
+    v[2] += f2.z();
     return (*this);
   }
-  float3 operator/(const float3 &f2) const {
-    return float3(x / f2.x, y / f2.y, z / f2.z);
+  real3 operator/(const real3 &f2) const {
+    return real3(x() / f2.x(), y() / f2.y(), z() / f2.z());
   }
-  float operator[](int i) const { return (&x)[i]; }
-  float &operator[](int i) { return (&x)[i]; }
+  real3 operator-() const { return real3(-x(), -y(), -z()); }
+  T operator[](int i) const { return v[i]; }
+  T &operator[](int i) { return v[i]; }
 
-  float3 neg() { return float3(-x, -y, -z); }
-
-  float length() { return sqrtf(x * x + y * y + z * z); }
-
-  void normalize() {
-    float len = length();
-    if (fabs(len) > 1.0e-6f) {
-      float inv_len = 1.0f / len;
-      x *= inv_len;
-      y *= inv_len;
-      z *= inv_len;
-    }
-  }
-
-  float x, y, z;
-  // float pad;  // for alignment
+  T v[3];
+  // T pad;  // for alignment (when T = float)
 };
 
-inline float3 operator*(float f, const float3 &v) {
-  return float3(v.x * f, v.y * f, v.z * f);
+template <typename T>
+inline real3<T> operator*(T f, const real3<T> &v) {
+  return real3<T>(v.x() * f, v.y() * f, v.z() * f);
 }
 
-inline float3 vcross(float3 a, float3 b) {
-  float3 c;
+template <typename T>
+inline real3<T> vneg(const real3<T> &rhs) {
+  return real3<T>(-rhs.x(), -rhs.y(), -rhs.z());
+}
+
+template <typename T>
+inline T vlength(const real3<T> &rhs) {
+  return std::sqrt(rhs.x() * rhs.x() + rhs.y() * rhs.y() + rhs.z() * rhs.z());
+}
+
+template <typename T>
+inline real3<T> vnormalize(const real3<T> &rhs) {
+  real3<T> v = rhs;
+  T len = vlength(rhs);
+  if (std::fabs(len) > std::numeric_limits<T>::epsilon()) {
+    T inv_len = static_cast<T>(1.0) / len;
+    v.v[0] *= inv_len;
+    v.v[1] *= inv_len;
+    v.v[2] *= inv_len;
+  }
+  return v;
+}
+
+template <typename T>
+inline real3<T> vcross(const real3<T> a, const real3<T> b) {
+  real3<T> c;
   c[0] = a[1] * b[2] - a[2] * b[1];
   c[1] = a[2] * b[0] - a[0] * b[2];
   c[2] = a[0] * b[1] - a[1] * b[0];
   return c;
 }
 
-inline float vdot(float3 a, float3 b) {
+template <typename T>
+inline T vdot(const real3<T> a, const real3<T> b) {
   return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
 }
 
-} // namespace
+template <typename T>
+inline real3<T> vsafe_inverse(const real3<T> v) {
+  real3<T> r;
 
-typedef struct {
-  float t;
-  float u;
-  float v;
-  unsigned int faceID;
-} Intersection;
+#ifdef NANORT_USE_CPP11_FEATURE
 
-typedef struct {
-  float org[3];    // must set
-  float dir[3];    // must set
-  float invDir[3]; // filled internally
-  int dirSign[3];  // filled internally
-} Ray;
+  if (std::fabs(v[0]) < std::numeric_limits<T>::epsilon()) {
+    r[0] = std::numeric_limits<T>::infinity() *
+           std::copysign(static_cast<T>(1), v[0]);
+  } else {
+    r[0] = static_cast<T>(1.0) / v[0];
+  }
 
+  if (std::fabs(v[1]) < std::numeric_limits<T>::epsilon()) {
+    r[1] = std::numeric_limits<T>::infinity() *
+           std::copysign(static_cast<T>(1), v[1]);
+  } else {
+    r[1] = static_cast<T>(1.0) / v[1];
+  }
+
+  if (std::fabs(v[2]) < std::numeric_limits<T>::epsilon()) {
+    r[2] = std::numeric_limits<T>::infinity() *
+           std::copysign(static_cast<T>(1), v[2]);
+  } else {
+    r[2] = static_cast<T>(1.0) / v[2];
+  }
+#else
+
+  if (std::fabs(v[0]) < std::numeric_limits<T>::epsilon()) {
+    T sgn = (v[0] < static_cast<T>(0)) ? static_cast<T>(-1) : static_cast<T>(1);
+    r[0] = std::numeric_limits<T>::infinity() * sgn;
+  } else {
+    r[0] = static_cast<T>(1.0) / v[0];
+  }
+
+  if (std::fabs(v[1]) < std::numeric_limits<T>::epsilon()) {
+    T sgn = (v[1] < static_cast<T>(0)) ? static_cast<T>(-1) : static_cast<T>(1);
+    r[1] = std::numeric_limits<T>::infinity() * sgn;
+  } else {
+    r[1] = static_cast<T>(1.0) / v[1];
+  }
+
+  if (std::fabs(v[2]) < std::numeric_limits<T>::epsilon()) {
+    T sgn = (v[2] < static_cast<T>(0)) ? static_cast<T>(-1) : static_cast<T>(1);
+    r[2] = std::numeric_limits<T>::infinity() * sgn;
+  } else {
+    r[2] = static_cast<T>(1.0) / v[2];
+  }
+#endif
+
+  return r;
+}
+
+template <typename real>
+inline const real *get_vertex_addr(const real *p, const size_t idx,
+                                   const size_t stride_bytes) {
+  return reinterpret_cast<const real *>(
+      reinterpret_cast<const unsigned char *>(p) + idx * stride_bytes);
+}
+
+template <typename T = float>
+class Ray {
+ public:
+  Ray()
+      : min_t(static_cast<T>(0.0)),
+        max_t(std::numeric_limits<T>::max()),
+        type(RAY_TYPE_NONE) {
+    org[0] = static_cast<T>(0.0);
+    org[1] = static_cast<T>(0.0);
+    org[2] = static_cast<T>(0.0);
+    dir[0] = static_cast<T>(0.0);
+    dir[1] = static_cast<T>(0.0);
+    dir[2] = static_cast<T>(-1.0);
+  }
+
+  T org[3];           // must set
+  T dir[3];           // must set
+  T min_t;            // minimum ray hit distance.
+  T max_t;            // maximum ray hit distance.
+  unsigned int type;  // ray type
+
+  // TODO(LTE): Align sizeof(Ray)
+};
+
+template <typename T = float>
 class BVHNode {
-public:
-  BVHNode(){};
-  ~BVHNode(){};
+ public:
+  BVHNode() {}
+  BVHNode(const BVHNode &rhs) {
+    bmin[0] = rhs.bmin[0];
+    bmin[1] = rhs.bmin[1];
+    bmin[2] = rhs.bmin[2];
+    flag = rhs.flag;
 
-  float bmin[3];
-  float bmax[3];
+    bmax[0] = rhs.bmax[0];
+    bmax[1] = rhs.bmax[1];
+    bmax[2] = rhs.bmax[2];
+    axis = rhs.axis;
 
-  int flag; // 1 = leaf node, 0 = branch node
+    data[0] = rhs.data[0];
+    data[1] = rhs.data[1];
+  }
+
+  BVHNode &operator=(const BVHNode &rhs) {
+    bmin[0] = rhs.bmin[0];
+    bmin[1] = rhs.bmin[1];
+    bmin[2] = rhs.bmin[2];
+    flag = rhs.flag;
+
+    bmax[0] = rhs.bmax[0];
+    bmax[1] = rhs.bmax[1];
+    bmax[2] = rhs.bmax[2];
+    axis = rhs.axis;
+
+    data[0] = rhs.data[0];
+    data[1] = rhs.data[1];
+
+    return (*this);
+  }
+
+  ~BVHNode() {}
+
+  T bmin[3];
+  T bmax[3];
+
+  int flag;  // 1 = leaf node, 0 = branch node
   int axis;
 
   // leaf
@@ -394,287 +541,250 @@ public:
   unsigned int data[2];
 };
 
-namespace {
-
-class IsectComparator {
-public:
-  bool operator()(const Intersection &a, const Intersection &b) const {
-    return a.t < b.t;
-  }
+template <class H>
+class IntersectComparator {
+ public:
+  bool operator()(const H &a, const H &b) const { return a.t < b.t; }
 };
 
-// Stores furthest intersection at top
-typedef std::priority_queue<Intersection, std::vector<Intersection>,
-                            IsectComparator> IsectVector;
-
-template <typename T> class Matrix {
-public:
-  void Print(T m[4][4]) {
-    for (int i = 0; i < 4; i++) {
-      printf("m[%d] = %f, %f, %f, %f\n", i, m[i][0], m[i][1], m[i][2], m[i][3]);
-    }
-  }
-
-  void Identity(T m[4][4]) {
-    m[0][0] = 1.0;
-    m[0][1] = 0.0;
-    m[0][2] = 0.0;
-    m[0][3] = 0.0;
-    m[1][0] = 0.0;
-    m[1][1] = 1.0;
-    m[1][2] = 0.0;
-    m[1][3] = 0.0;
-    m[2][0] = 0.0;
-    m[2][1] = 0.0;
-    m[2][2] = 1.0;
-    m[2][3] = 0.0;
-    m[3][0] = 0.0;
-    m[3][1] = 0.0;
-    m[3][2] = 0.0;
-    m[3][3] = 1.0;
-  }
-
-  void Inverse(T m[4][4]) {
-    /*
-     * codes from intel web
-     * cramer's rule version
-     */
-    int i, j;
-    T tmp[12];  /* tmp array for pairs */
-    T tsrc[16]; /* array of transpose source matrix */
-    T det;      /* determinant */
-
-    /* transpose matrix */
-    for (i = 0; i < 4; i++) {
-      tsrc[i] = m[i][0];
-      tsrc[i + 4] = m[i][1];
-      tsrc[i + 8] = m[i][2];
-      tsrc[i + 12] = m[i][3];
-    }
-
-    /* calculate pair for first 8 elements(cofactors) */
-    tmp[0] = tsrc[10] * tsrc[15];
-    tmp[1] = tsrc[11] * tsrc[14];
-    tmp[2] = tsrc[9] * tsrc[15];
-    tmp[3] = tsrc[11] * tsrc[13];
-    tmp[4] = tsrc[9] * tsrc[14];
-    tmp[5] = tsrc[10] * tsrc[13];
-    tmp[6] = tsrc[8] * tsrc[15];
-    tmp[7] = tsrc[11] * tsrc[12];
-    tmp[8] = tsrc[8] * tsrc[14];
-    tmp[9] = tsrc[10] * tsrc[12];
-    tmp[10] = tsrc[8] * tsrc[13];
-    tmp[11] = tsrc[9] * tsrc[12];
-
-    /* calculate first 8 elements(cofactors) */
-    m[0][0] = tmp[0] * tsrc[5] + tmp[3] * tsrc[6] + tmp[4] * tsrc[7];
-    m[0][0] -= tmp[1] * tsrc[5] + tmp[2] * tsrc[6] + tmp[5] * tsrc[7];
-    m[0][1] = tmp[1] * tsrc[4] + tmp[6] * tsrc[6] + tmp[9] * tsrc[7];
-    m[0][1] -= tmp[0] * tsrc[4] + tmp[7] * tsrc[6] + tmp[8] * tsrc[7];
-    m[0][2] = tmp[2] * tsrc[4] + tmp[7] * tsrc[5] + tmp[10] * tsrc[7];
-    m[0][2] -= tmp[3] * tsrc[4] + tmp[6] * tsrc[5] + tmp[11] * tsrc[7];
-    m[0][3] = tmp[5] * tsrc[4] + tmp[8] * tsrc[5] + tmp[11] * tsrc[6];
-    m[0][3] -= tmp[4] * tsrc[4] + tmp[9] * tsrc[5] + tmp[10] * tsrc[6];
-    m[1][0] = tmp[1] * tsrc[1] + tmp[2] * tsrc[2] + tmp[5] * tsrc[3];
-    m[1][0] -= tmp[0] * tsrc[1] + tmp[3] * tsrc[2] + tmp[4] * tsrc[3];
-    m[1][1] = tmp[0] * tsrc[0] + tmp[7] * tsrc[2] + tmp[8] * tsrc[3];
-    m[1][1] -= tmp[1] * tsrc[0] + tmp[6] * tsrc[2] + tmp[9] * tsrc[3];
-    m[1][2] = tmp[3] * tsrc[0] + tmp[6] * tsrc[1] + tmp[11] * tsrc[3];
-    m[1][2] -= tmp[2] * tsrc[0] + tmp[7] * tsrc[1] + tmp[10] * tsrc[3];
-    m[1][3] = tmp[4] * tsrc[0] + tmp[9] * tsrc[1] + tmp[10] * tsrc[2];
-    m[1][3] -= tmp[5] * tsrc[0] + tmp[8] * tsrc[1] + tmp[11] * tsrc[2];
-
-    /* calculate pairs for second 8 elements(cofactors) */
-    tmp[0] = tsrc[2] * tsrc[7];
-    tmp[1] = tsrc[3] * tsrc[6];
-    tmp[2] = tsrc[1] * tsrc[7];
-    tmp[3] = tsrc[3] * tsrc[5];
-    tmp[4] = tsrc[1] * tsrc[6];
-    tmp[5] = tsrc[2] * tsrc[5];
-    tmp[6] = tsrc[0] * tsrc[7];
-    tmp[7] = tsrc[3] * tsrc[4];
-    tmp[8] = tsrc[0] * tsrc[6];
-    tmp[9] = tsrc[2] * tsrc[4];
-    tmp[10] = tsrc[0] * tsrc[5];
-    tmp[11] = tsrc[1] * tsrc[4];
-
-    /* calculate second 8 elements(cofactors) */
-    m[2][0] = tmp[0] * tsrc[13] + tmp[3] * tsrc[14] + tmp[4] * tsrc[15];
-    m[2][0] -= tmp[1] * tsrc[13] + tmp[2] * tsrc[14] + tmp[5] * tsrc[15];
-    m[2][1] = tmp[1] * tsrc[12] + tmp[6] * tsrc[14] + tmp[9] * tsrc[15];
-    m[2][1] -= tmp[0] * tsrc[12] + tmp[7] * tsrc[14] + tmp[8] * tsrc[15];
-    m[2][2] = tmp[2] * tsrc[12] + tmp[7] * tsrc[13] + tmp[10] * tsrc[15];
-    m[2][2] -= tmp[3] * tsrc[12] + tmp[6] * tsrc[13] + tmp[11] * tsrc[15];
-    m[2][3] = tmp[5] * tsrc[12] + tmp[8] * tsrc[13] + tmp[11] * tsrc[14];
-    m[2][3] -= tmp[4] * tsrc[12] + tmp[9] * tsrc[13] + tmp[10] * tsrc[14];
-    m[3][0] = tmp[2] * tsrc[10] + tmp[5] * tsrc[11] + tmp[1] * tsrc[9];
-    m[3][0] -= tmp[4] * tsrc[11] + tmp[0] * tsrc[9] + tmp[3] * tsrc[10];
-    m[3][1] = tmp[8] * tsrc[11] + tmp[0] * tsrc[8] + tmp[7] * tsrc[10];
-    m[3][1] -= tmp[6] * tsrc[10] + tmp[9] * tsrc[11] + tmp[1] * tsrc[8];
-    m[3][2] = tmp[6] * tsrc[9] + tmp[11] * tsrc[11] + tmp[3] * tsrc[8];
-    m[3][2] -= tmp[10] * tsrc[11] + tmp[2] * tsrc[8] + tmp[7] * tsrc[9];
-    m[3][3] = tmp[10] * tsrc[10] + tmp[4] * tsrc[8] + tmp[9] * tsrc[9];
-    m[3][3] -= tmp[8] * tsrc[9] + tmp[11] * tsrc[0] + tmp[5] * tsrc[8];
-
-    /* calculate determinant */
-    det = tsrc[0] * m[0][0] + tsrc[1] * m[0][1] + tsrc[2] * m[0][2] +
-          tsrc[3] * m[0][3];
-
-    /* calculate matrix inverse */
-    det = 1.0 / det;
-
-    for (j = 0; j < 4; j++) {
-      for (i = 0; i < 4; i++) {
-        m[j][i] *= det;
-      }
-    }
-  }
-
-  void Transpose(T m[4][4]) {
-    T t[4][4];
-
-    // Transpose
-    for (int j = 0; j < 4; j++) {
-      for (int i = 0; i < 4; i++) {
-        t[j][i] = m[i][j];
-      }
-    }
-
-    // Copy
-    for (int j = 0; j < 4; j++) {
-      for (int i = 0; i < 4; i++) {
-        m[j][i] = t[j][i];
-      }
-    }
-  }
-
-  void Mult(T dst[4][4], const T m0[4][4], const T m1[4][4]) {
-    for (int i = 0; i < 4; ++i) {
-      for (int j = 0; j < 4; ++j) {
-        dst[i][j] = 0;
-        for (int k = 0; k < 4; ++k) {
-          dst[i][j] += m0[k][j] * m1[i][k];
-        }
-      }
-    }
-  }
-
-  void MultV(T dst[3], const T m[4][4], const T v[3]) {
-    T tmp[3];
-    tmp[0] = m[0][0] * v[0] + m[1][0] * v[1] + m[2][0] * v[2] + m[3][0];
-    tmp[1] = m[0][1] * v[0] + m[1][1] * v[1] + m[2][1] * v[2] + m[3][1];
-    tmp[2] = m[0][2] * v[0] + m[1][2] * v[1] + m[2][2] * v[2] + m[3][2];
-    dst[0] = tmp[0];
-    dst[1] = tmp[1];
-    dst[2] = tmp[2];
-  }
-
-  void MultV(float3 &dst, const T m[4][4], const float3 &v) {
-    T tmp[3];
-    tmp[0] = m[0][0] * v[0] + m[1][0] * v[1] + m[2][0] * v[2] + m[3][0];
-    tmp[1] = m[0][1] * v[0] + m[1][1] * v[1] + m[2][1] * v[2] + m[3][1];
-    tmp[2] = m[0][2] * v[0] + m[1][2] * v[1] + m[2][2] * v[2] + m[3][2];
-    dst[0] = tmp[0];
-    dst[1] = tmp[1];
-    dst[2] = tmp[2];
-  }
-};
-}
-
-///< BVH build option.
+/// BVH build option.
+template <typename T = float>
 struct BVHBuildOptions {
-  float costTaabb;
-  int minLeafPrimitives;
-  int maxTreeDepth;
-  int binSize;
-  int shallowDepth;
-  size_t minPrimitivesForParallelBuild;
+  T cost_t_aabb;
+  unsigned int min_leaf_primitives;
+  unsigned int max_tree_depth;
+  unsigned int bin_size;
+  unsigned int shallow_depth;
+  unsigned int min_primitives_for_parallel_build;
 
   // Cache bounding box computation.
   // Requires more memory, but BVHbuild can be faster.
-  bool cacheBBox;
+  bool cache_bbox;
+  unsigned char pad[3];
 
   // Set default value: Taabb = 0.2
   BVHBuildOptions()
-      : costTaabb(0.2f), minLeafPrimitives(4), maxTreeDepth(256), binSize(64),
-        shallowDepth(3), minPrimitivesForParallelBuild(1024 * 128),
-        cacheBBox(false) {}
+      : cost_t_aabb(static_cast<T>(0.2)),
+        min_leaf_primitives(4),
+        max_tree_depth(256),
+        bin_size(64),
+        shallow_depth(kNANORT_SHALLOW_DEPTH),
+        min_primitives_for_parallel_build(
+            kNANORT_MIN_PRIMITIVES_FOR_PARALLEL_BUILD),
+        cache_bbox(false) {}
 };
 
-///< BVH build statistics.
+/// BVH build statistics.
 class BVHBuildStatistics {
-public:
-  int maxTreeDepth;
-  int numLeafNodes;
-  int numBranchNodes;
-  float epsScale;
-  double buildSecs;
+ public:
+  unsigned int max_tree_depth;
+  unsigned int num_leaf_nodes;
+  unsigned int num_branch_nodes;
+  float build_secs;
 
   // Set default value: Taabb = 0.2
   BVHBuildStatistics()
-      : maxTreeDepth(0), numLeafNodes(0), numBranchNodes(0), epsScale(1.0f),
-        buildSecs(0.0) {}
+      : max_tree_depth(0),
+        num_leaf_nodes(0),
+        num_branch_nodes(0),
+        build_secs(0.0f) {}
 };
 
-///< BVH trace option.
+///
+/// @brief BVH trace option.
+///
 class BVHTraceOptions {
-public:
+ public:
   // Hit only for face IDs in indexRange.
   // This feature is good to mimic something like glDrawArrays()
-  unsigned int faceIdsRange[2];
+  unsigned int prim_ids_range[2];
+
+  // Prim ID to skip for avoiding self-intersection
+  // -1 = no skipping
+  unsigned int skip_prim_id;
+
+  bool cull_back_face;
+  unsigned char pad[3];  ///< Padding (not used)
 
   BVHTraceOptions() {
-    faceIdsRange[0] = 0;
-    faceIdsRange[1] = 0x7FFFFFFF; // Up to 2G face IDs.
+    prim_ids_range[0] = 0;
+    prim_ids_range[1] = 0x7FFFFFFF;  // Up to 2G face IDs.
+
+    skip_prim_id = static_cast<unsigned int>(-1);
+    cull_back_face = false;
   }
 };
 
+///
+/// @brief Bounding box.
+///
+template <typename T>
 class BBox {
-public:
-  float bmin[3];
-  float bmax[3];
+ public:
+  real3<T> bmin;
+  real3<T> bmax;
 
   BBox() {
-    bmin[0] = bmin[1] = bmin[2] = std::numeric_limits<float>::max();
-    bmax[0] = bmax[1] = bmax[2] = -std::numeric_limits<float>::max();
+    bmin[0] = bmin[1] = bmin[2] = std::numeric_limits<T>::max();
+    bmax[0] = bmax[1] = bmax[2] = -std::numeric_limits<T>::max();
   }
 };
 
+///
+/// @brief Hit class for traversing nodes.
+///
+/// Stores hit information of node traversal.
+/// Node traversal is used for two-level ray tracing(efficient ray traversal of a scene hierarchy)
+///
+template <typename T>
+class NodeHit {
+ public:
+  NodeHit()
+      : t_min(std::numeric_limits<T>::max()),
+        t_max(-std::numeric_limits<T>::max()),
+        node_id(static_cast<unsigned int>(-1)) {}
+
+  NodeHit(const NodeHit<T> &rhs) {
+    t_min = rhs.t_min;
+    t_max = rhs.t_max;
+    node_id = rhs.node_id;
+  }
+
+  NodeHit &operator=(const NodeHit<T> &rhs) {
+    t_min = rhs.t_min;
+    t_max = rhs.t_max;
+    node_id = rhs.node_id;
+
+    return (*this);
+  }
+
+  ~NodeHit() {}
+
+  T t_min;
+  T t_max;
+  unsigned int node_id;
+};
+
+///
+/// @brief Comparator object for NodeHit.
+///
+/// Comparator object for finding nearest hit point in node traversal.
+///
+template <typename T>
+class NodeHitComparator {
+ public:
+  inline bool operator()(const NodeHit<T> &a, const NodeHit<T> &b) {
+    return a.t_min < b.t_min;
+  }
+};
+
+///
+/// @brief Bounding Volume Hierarchy acceleration.
+///
+/// BVHAccel is central part of ray tracing(ray traversal).
+/// BVHAccel takes an input geometry(primitive) information and build a data structure
+/// for efficient ray tracing(`O(log2 N)` in theory, where N is the number of primitive in the scene).
+///
+/// @tparam T real value type(float or double).
+///
+template <typename T>
 class BVHAccel {
-public:
-  BVHAccel() : epsScale_(1.0f){};
-  ~BVHAccel(){};
+ public:
+  BVHAccel() : pad0_(0) { (void)pad0_; }
+  ~BVHAccel() {}
 
-  ///< Build BVH for input mesh.
-  bool Build(const float *vertices, const unsigned int *faces,
-             const unsigned int numFaces, const BVHBuildOptions &options);
+  ///
+  /// Build BVH for input primitives.
+  ///
+  /// @tparam Prim Primitive(e.g. Triangle) accessor class.
+  /// @tparam Pred Predicator(comparator class object for `Prim` class to find nearest hit point)
+  ///
+  /// @param[in] num_primitives The number of primitive.
+  /// @param[in] p Primitive accessor class object.
+  /// @param[in] pred Predicator object.
+  ///
+  /// @return true upon success.
+  ///
+  template <class Prim, class Pred>
+  bool Build(const unsigned int num_primitives, const Prim &p, const Pred &pred,
+             const BVHBuildOptions<T> &options = BVHBuildOptions<T>());
 
-  ///< Get statistics of built BVH tree. Valid after Build()
+  ///
+  /// Get statistics of built BVH tree. Valid after `Build()`
+  ///
+  /// @return BVH build statistics.
+  ///
   BVHBuildStatistics GetStatistics() const { return stats_; }
 
-  ///< Dump built BVH to the file.
-  bool Dump(const char *filename);
+#if defined(NANORT_ENABLE_SERIALIZATION)
+  ///
+  /// Dump built BVH to the file.
+  ///
+  bool Dump(const char *filename) const;
+  bool Dump(FILE *fp) const;
 
+  ///
   /// Load BVH binary
+  ///
   bool Load(const char *filename);
+  bool Load(FILE *fp);
+#endif
 
-  ///< Traverse into BVH along ray and find closest hit point if found
-  bool Traverse(Intersection &isect, const float *vertices,
-                const unsigned int *faces, const Ray &ray, const BVHTraceOptions& options);
+  void Debug();
 
-  ///< Multi-hit ray tracversal
-  ///< Returns `maxIntersections` frontmost intersections
-  bool MultiHitTraverse(StackVector<Intersection, 128> &isects,
-                        int maxIntersections, const float *vertices,
-                        const unsigned int *faces, Ray &ray);
+  ///
+  /// @brief Traverse into BVH along ray and find closest hit point & primitive if
+  /// found
+  ///
+  /// @tparam I Intersector class
+  /// @tparam H Hit class
+  ///
+  /// @param[in] ray Input ray
+  /// @param[in] intersector Intersector object. This object is called for each possible intersection of ray and BVH during traversal.
+  /// @param[out] isect Intersection point information(filled when closest hit point was found)
+  /// @param[in] options Traversal options.
+  ///
+  /// @return true if the closest hit point found.
+  ///
+  template <class I, class H>
+  bool Traverse(const Ray<T> &ray, const I &intersector, H *isect,
+                const BVHTraceOptions &options = BVHTraceOptions()) const;
 
-  const std::vector<BVHNode> &GetNodes() const { return nodes_; }
+#if 0
+  /// Multi-hit ray traversal
+  /// Returns `max_intersections` frontmost intersections
+  template<class I, class H, class Comp>
+  bool MultiHitTraverse(const Ray<T> &ray,
+                        int max_intersections,
+                        const I &intersector,
+                        StackVector<H, 128> *isects,
+                        const BVHTraceOptions &options = BVHTraceOptions()) const;
+#endif
+
+  ///
+  /// List up nodes which intersects along the ray.
+  /// This function is useful for two-level BVH traversal.
+  /// See `examples/nanosg` for example.
+  ///
+  /// @tparam I Intersection class
+  ///
+  ///
+  ///
+  template <class I>
+  bool ListNodeIntersections(const Ray<T> &ray, int max_intersections,
+                             const I &intersector,
+                             StackVector<NodeHit<T>, 128> *hits) const;
+
+  const std::vector<BVHNode<T> > &GetNodes() const { return nodes_; }
   const std::vector<unsigned int> &GetIndices() const { return indices_; }
 
-  void BoundingBox(float bmin[3], float bmax[3]) const {
+  ///
+  /// Returns bounding box of built BVH.
+  ///
+  void BoundingBox(T bmin[3], T bmax[3]) const {
     if (nodes_.empty()) {
-      bmin[0] = bmin[1] = bmin[2] = std::numeric_limits<float>::max();
-      bmax[0] = bmax[1] = bmax[2] = -std::numeric_limits<float>::max();
+      bmin[0] = bmin[1] = bmin[2] = std::numeric_limits<T>::max();
+      bmax[0] = bmax[1] = bmax[2] = -std::numeric_limits<T>::max();
     } else {
       bmin[0] = nodes_[0].bmin[0];
       bmin[1] = nodes_[0].bmin[1];
@@ -685,229 +795,598 @@ public:
     }
   }
 
-private:
-#if NANORT_ENABLE_PARALLEL_BUILD
+  bool IsValid() const { return nodes_.size() > 0; }
+
+ private:
+#if defined(NANORT_ENABLE_PARALLEL_BUILD)
   typedef struct {
-    unsigned int leftIdx;
-    unsigned int rightIdx;
+    unsigned int left_idx;
+    unsigned int right_idx;
     unsigned int offset;
   } ShallowNodeInfo;
 
   // Used only during BVH construction
-  std::vector<ShallowNodeInfo> shallowNodeInfos_;
+  std::vector<ShallowNodeInfo> shallow_node_infos_;
 
-  ///< Builds shallow BVH tree recursively.
-  unsigned int BuildShallowTree(std::vector<BVHNode> &outNodes,
-                                const float *vertices,
-                                const unsigned int *faces, unsigned int leftIdx,
-                                unsigned int rightIdx, int depth,
-                                int maxShallowDepth, float epsScale);
+  /// Builds shallow BVH tree recursively.
+  template <class P, class Pred>
+  unsigned int BuildShallowTree(std::vector<BVHNode<T> > *out_nodes,
+                                unsigned int left_idx, unsigned int right_idx,
+                                unsigned int depth,
+                                unsigned int max_shallow_depth, const P &p,
+                                const Pred &pred);
 #endif
 
-  ///< Builds BVH tree recursively.
-  size_t BuildTree(BVHBuildStatistics &outStat, std::vector<BVHNode> &outNodes,
-                   const float *vertices, const unsigned int *faces,
-                   unsigned int leftIdx, unsigned int rightIdx, int depth,
-                   float epsScale);
+  /// Builds BVH tree recursively.
+  template <class P, class Pred>
+  unsigned int BuildTree(BVHBuildStatistics *out_stat,
+                         std::vector<BVHNode<T> > *out_nodes,
+                         unsigned int left_idx, unsigned int right_idx,
+                         unsigned int depth, const P &p, const Pred &pred);
 
-  BVHBuildOptions options_;
-  std::vector<BVHNode> nodes_;
-  std::vector<unsigned int> indices_; // max 4G triangles.
-  BVHBuildStatistics stats_;
-  float epsScale_;
-  std::vector<BBox> bboxes_;
-};
+  template <class I>
+  bool TestLeafNode(const BVHNode<T> &node, const Ray<T> &ray,
+                    const I &intersector) const;
+
+  template <class I>
+  bool TestLeafNodeIntersections(
+      const BVHNode<T> &node, const Ray<T> &ray, const int max_intersections,
+      const I &intersector,
+      std::priority_queue<NodeHit<T>, std::vector<NodeHit<T> >,
+                          NodeHitComparator<T> > *isect_pq) const;
 
 #if 0
-class BVHBox
-{
-
-}
-
-class Scene
-{
-  std::vector<BVHBox> nodes_;
-};
+  template<class I, class H, class Comp>
+  bool MultiHitTestLeafNode(std::priority_queue<H, std::vector<H>, Comp> *isect_pq,
+                            int max_intersections,
+                            const BVHNode<T> &node, const Ray<T> &ray,
+                            const I &intersector) const;
 #endif
 
-} // namespace nanort
+  std::vector<BVHNode<T> > nodes_;
+  std::vector<unsigned int> indices_;  // max 4G triangles.
+  std::vector<BBox<T> > bboxes_;
+  BVHBuildOptions<T> options_;
+  BVHBuildStatistics stats_;
+  unsigned int pad0_;
+};
 
-#ifdef NANORT_IMPLEMENTATION
+// Predefined SAH predicator for triangle.
+template <typename T = float>
+class TriangleSAHPred {
+ public:
+  TriangleSAHPred(
+      const T *vertices, const unsigned int *faces,
+      size_t vertex_stride_bytes)  // e.g. 12 for sizeof(float) * XYZ
+      : axis_(0),
+        pos_(static_cast<T>(0.0)),
+        vertices_(vertices),
+        faces_(faces),
+        vertex_stride_bytes_(vertex_stride_bytes) {}
 
-#include <limits>
-#include <cassert>
-#include <algorithm>
-#include <functional>
+  TriangleSAHPred(const TriangleSAHPred<T> &rhs)
+      : axis_(rhs.axis_),
+        pos_(rhs.pos_),
+        vertices_(rhs.vertices_),
+        faces_(rhs.faces_),
+        vertex_stride_bytes_(rhs.vertex_stride_bytes_) {}
+
+  TriangleSAHPred<T> &operator=(const TriangleSAHPred<T> &rhs) {
+    axis_ = rhs.axis_;
+    pos_ = rhs.pos_;
+    vertices_ = rhs.vertices_;
+    faces_ = rhs.faces_;
+    vertex_stride_bytes_ = rhs.vertex_stride_bytes_;
+
+    return (*this);
+  }
+
+  void Set(int axis, T pos) const {
+    axis_ = axis;
+    pos_ = pos;
+  }
+
+  bool operator()(unsigned int i) const {
+    int axis = axis_;
+    T pos = pos_;
+
+    unsigned int i0 = faces_[3 * i + 0];
+    unsigned int i1 = faces_[3 * i + 1];
+    unsigned int i2 = faces_[3 * i + 2];
+
+    real3<T> p0(get_vertex_addr<T>(vertices_, i0, vertex_stride_bytes_));
+    real3<T> p1(get_vertex_addr<T>(vertices_, i1, vertex_stride_bytes_));
+    real3<T> p2(get_vertex_addr<T>(vertices_, i2, vertex_stride_bytes_));
+
+    T center = p0[axis] + p1[axis] + p2[axis];
+
+    return (center < pos * static_cast<T>(3.0));
+  }
+
+ private:
+  mutable int axis_;
+  mutable T pos_;
+  const T *vertices_;
+  const unsigned int *faces_;
+  const size_t vertex_stride_bytes_;
+};
+
+// Predefined Triangle mesh geometry.
+template <typename T = float>
+class TriangleMesh {
+ public:
+  TriangleMesh(
+      const T *vertices, const unsigned int *faces,
+      const size_t vertex_stride_bytes)  // e.g. 12 for sizeof(float) * XYZ
+      : vertices_(vertices),
+        faces_(faces),
+        vertex_stride_bytes_(vertex_stride_bytes) {}
+
+  /// Compute bounding box for `prim_index`th triangle.
+  /// This function is called for each primitive in BVH build.
+  void BoundingBox(real3<T> *bmin, real3<T> *bmax,
+                   unsigned int prim_index) const {
+    unsigned vertex = faces_[3 * prim_index + 0];
+
+    (*bmin)[0] = get_vertex_addr(vertices_, vertex, vertex_stride_bytes_)[0];
+    (*bmin)[1] = get_vertex_addr(vertices_, vertex, vertex_stride_bytes_)[1];
+    (*bmin)[2] = get_vertex_addr(vertices_, vertex, vertex_stride_bytes_)[2];
+    (*bmax)[0] = get_vertex_addr(vertices_, vertex, vertex_stride_bytes_)[0];
+    (*bmax)[1] = get_vertex_addr(vertices_, vertex, vertex_stride_bytes_)[1];
+    (*bmax)[2] = get_vertex_addr(vertices_, vertex, vertex_stride_bytes_)[2];
+
+    // remaining two vertices of the primitive
+    for (unsigned int i = 1; i < 3; i++) {
+      // xyz
+      for (int k = 0; k < 3; k++) {
+        T coord = get_vertex_addr<T>(vertices_, faces_[3 * prim_index + i],
+                                     vertex_stride_bytes_)[k];
+
+        (*bmin)[k] = std::min((*bmin)[k], coord);
+        (*bmax)[k] = std::max((*bmax)[k], coord);
+      }
+    }
+  }
+
+  const T *vertices_;
+  const unsigned int *faces_;
+  const size_t vertex_stride_bytes_;
+
+  //
+  // Accessors
+  //
+  const T *GetVertices() const {
+    return vertices_;
+  }
+
+  const unsigned int *GetFaces() const {
+    return faces_;
+  }
+
+  size_t GetVertexStrideBytes() const {
+    return vertex_stride_bytes_;
+  }
+};
+
+///
+/// Stores intersection point information for triangle geometry.
+///
+template <typename T = float>
+class TriangleIntersection {
+ public:
+  T u;
+  T v;
+
+  // Required member variables.
+  T t;
+  unsigned int prim_id;
+};
+
+///
+/// Intersector is a template class which implements intersection method and stores
+/// intesection point information(`H`)
+///
+/// @tparam T Precision(float or double)
+/// @tparam H Intersection point information struct
+///
+template <typename T = float, class H = TriangleIntersection<T> >
+class TriangleIntersector {
+ public:
+
+  // Initialize from mesh object.
+  // M: mesh class
+  template<class M>
+  TriangleIntersector(const M &m)
+      : vertices_(m.GetVertices()),
+        faces_(m.GetFaces()),
+        vertex_stride_bytes_(m.GetVertexStrideBytes()) {}
+
+  template<class M>
+  TriangleIntersector(const M *m)
+      : vertices_(m->GetVertices()),
+        faces_(m->GetFaces()),
+        vertex_stride_bytes_(m->GetVertexStrideBytes()) {}
+
+  TriangleIntersector(const T *vertices, const unsigned int *faces,
+                      const size_t vertex_stride_bytes)  // e.g.
+                                                         // vertex_stride_bytes
+                                                         // = 12 = sizeof(float)
+                                                         // * 3
+      : vertices_(vertices),
+        faces_(faces),
+        vertex_stride_bytes_(vertex_stride_bytes) {}
+
+  // For Watertight Ray/Triangle Intersection.
+  typedef struct {
+    T Sx;
+    T Sy;
+    T Sz;
+    int kx;
+    int ky;
+    int kz;
+  } RayCoeff;
+
+  /// Do ray intersection stuff for `prim_index` th primitive and return hit
+  /// distance `t`, barycentric coordinate `u` and `v`.
+  /// Returns true if there's intersection.
+  bool Intersect(T *t_inout, const unsigned int prim_index) const {
+    if ((prim_index < trace_options_.prim_ids_range[0]) ||
+        (prim_index >= trace_options_.prim_ids_range[1])) {
+      return false;
+    }
+
+    // Self-intersection test.
+    if (prim_index == trace_options_.skip_prim_id) {
+      return false;
+    }
+
+    const unsigned int f0 = faces_[3 * prim_index + 0];
+    const unsigned int f1 = faces_[3 * prim_index + 1];
+    const unsigned int f2 = faces_[3 * prim_index + 2];
+
+    const real3<T> p0(get_vertex_addr(vertices_, f0 + 0, vertex_stride_bytes_));
+    const real3<T> p1(get_vertex_addr(vertices_, f1 + 0, vertex_stride_bytes_));
+    const real3<T> p2(get_vertex_addr(vertices_, f2 + 0, vertex_stride_bytes_));
+
+    const real3<T> A = p0 - ray_org_;
+    const real3<T> B = p1 - ray_org_;
+    const real3<T> C = p2 - ray_org_;
+
+    const T Ax = A[ray_coeff_.kx] - ray_coeff_.Sx * A[ray_coeff_.kz];
+    const T Ay = A[ray_coeff_.ky] - ray_coeff_.Sy * A[ray_coeff_.kz];
+    const T Bx = B[ray_coeff_.kx] - ray_coeff_.Sx * B[ray_coeff_.kz];
+    const T By = B[ray_coeff_.ky] - ray_coeff_.Sy * B[ray_coeff_.kz];
+    const T Cx = C[ray_coeff_.kx] - ray_coeff_.Sx * C[ray_coeff_.kz];
+    const T Cy = C[ray_coeff_.ky] - ray_coeff_.Sy * C[ray_coeff_.kz];
+
+    T U = Cx * By - Cy * Bx;
+    T V = Ax * Cy - Ay * Cx;
+    T W = Bx * Ay - By * Ax;
+
+#ifdef __clang__
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wfloat-equal"
+#endif
+
+    // Fall back to test against edges using double precision.
+    if (U == static_cast<T>(0.0) || V == static_cast<T>(0.0) ||
+        W == static_cast<T>(0.0)) {
+      double CxBy = static_cast<double>(Cx) * static_cast<double>(By);
+      double CyBx = static_cast<double>(Cy) * static_cast<double>(Bx);
+      U = static_cast<T>(CxBy - CyBx);
+
+      double AxCy = static_cast<double>(Ax) * static_cast<double>(Cy);
+      double AyCx = static_cast<double>(Ay) * static_cast<double>(Cx);
+      V = static_cast<T>(AxCy - AyCx);
+
+      double BxAy = static_cast<double>(Bx) * static_cast<double>(Ay);
+      double ByAx = static_cast<double>(By) * static_cast<double>(Ax);
+      W = static_cast<T>(BxAy - ByAx);
+    }
+
+    if (U < static_cast<T>(0.0) || V < static_cast<T>(0.0) ||
+        W < static_cast<T>(0.0)) {
+      if (trace_options_.cull_back_face ||
+          (U > static_cast<T>(0.0) || V > static_cast<T>(0.0) ||
+           W > static_cast<T>(0.0))) {
+        return false;
+      }
+    }
+
+    T det = U + V + W;
+    if (det == static_cast<T>(0.0)) return false;
+
+#ifdef __clang__
+#pragma clang diagnostic pop
+#endif
+
+    const T Az = ray_coeff_.Sz * A[ray_coeff_.kz];
+    const T Bz = ray_coeff_.Sz * B[ray_coeff_.kz];
+    const T Cz = ray_coeff_.Sz * C[ray_coeff_.kz];
+    const T D = U * Az + V * Bz + W * Cz;
+
+    const T rcpDet = static_cast<T>(1.0) / det;
+    T tt = D * rcpDet;
+
+    if (tt > (*t_inout)) {
+      return false;
+    }
+
+    if (tt < t_min_) {
+      return false;
+    }
+
+    (*t_inout) = tt;
+    // Use Möller-Trumbore style barycentric coordinates
+    // U + V + W = 1.0 and interp(p) = U * p0 + V * p1 + W * p2
+    // We want interp(p) = (1 - u - v) * p0 + u * v1 + v * p2;
+    // => u = V, v = W.
+    u_ = V * rcpDet;
+    v_ = W * rcpDet;
+
+    return true;
+  }
+
+  /// Returns the nearest hit distance.
+  T GetT() const { return t_; }
+
+  /// Update is called when initializing intersection and nearest hit is found.
+  void Update(T t, unsigned int prim_idx) const {
+    t_ = t;
+    prim_id_ = prim_idx;
+  }
+
+  /// Prepare BVH traversal (e.g. compute inverse ray direction)
+  /// This function is called only once in BVH traversal.
+  void PrepareTraversal(const Ray<T> &ray,
+                        const BVHTraceOptions &trace_options) const {
+    ray_org_[0] = ray.org[0];
+    ray_org_[1] = ray.org[1];
+    ray_org_[2] = ray.org[2];
+
+    // Calculate dimension where the ray direction is maximal.
+    ray_coeff_.kz = 0;
+    T absDir = std::fabs(ray.dir[0]);
+    if (absDir < std::fabs(ray.dir[1])) {
+      ray_coeff_.kz = 1;
+      absDir = std::fabs(ray.dir[1]);
+    }
+    if (absDir < std::fabs(ray.dir[2])) {
+      ray_coeff_.kz = 2;
+      absDir = std::fabs(ray.dir[2]);
+    }
+
+    ray_coeff_.kx = ray_coeff_.kz + 1;
+    if (ray_coeff_.kx == 3) ray_coeff_.kx = 0;
+    ray_coeff_.ky = ray_coeff_.kx + 1;
+    if (ray_coeff_.ky == 3) ray_coeff_.ky = 0;
+
+    // Swap kx and ky dimension to preserve winding direction of triangles.
+    if (ray.dir[ray_coeff_.kz] < static_cast<T>(0.0))
+      std::swap(ray_coeff_.kx, ray_coeff_.ky);
+
+    // Calculate shear constants.
+    ray_coeff_.Sx = ray.dir[ray_coeff_.kx] / ray.dir[ray_coeff_.kz];
+    ray_coeff_.Sy = ray.dir[ray_coeff_.ky] / ray.dir[ray_coeff_.kz];
+    ray_coeff_.Sz = static_cast<T>(1.0) / ray.dir[ray_coeff_.kz];
+
+    trace_options_ = trace_options;
+
+    t_min_ = ray.min_t;
+
+    u_ = static_cast<T>(0.0);
+    v_ = static_cast<T>(0.0);
+  }
+
+  /// Post BVH traversal stuff.
+  /// Fill `isect` if there is a hit.
+  void PostTraversal(const Ray<T> &ray, bool hit, H *isect) const {
+    if (hit && isect) {
+      (*isect).t = t_;
+      (*isect).u = u_;
+      (*isect).v = v_;
+      (*isect).prim_id = prim_id_;
+    }
+    (void)ray;
+  }
+
+ private:
+  const T *vertices_;
+  const unsigned int *faces_;
+  const size_t vertex_stride_bytes_;
+
+  mutable real3<T> ray_org_;
+  mutable RayCoeff ray_coeff_;
+  mutable BVHTraceOptions trace_options_;
+  mutable T t_min_;
+
+  mutable T t_;
+  mutable T u_;
+  mutable T v_;
+  mutable unsigned int prim_id_;
+};
+
+//
+// Robust BVH Ray Traversal : http://jcgt.org/published/0002/02/02/paper.pdf
+//
+
+// NaN-safe min and max function.
+template <class T>
+const T &safemin(const T &a, const T &b) {
+  return (a < b) ? a : b;
+}
+template <class T>
+const T &safemax(const T &a, const T &b) {
+  return (a > b) ? a : b;
+}
 
 //
 // SAH functions
 //
-namespace nanort {
-
 struct BinBuffer {
-
-  BinBuffer(int size) {
-    binSize = size;
+  explicit BinBuffer(unsigned int size) {
+    bin_size = size;
     bin.resize(2 * 3 * size);
     clear();
   }
 
-  void clear() { memset(&bin[0], 0, sizeof(size_t) * 2 * 3 * binSize); }
+  void clear() { memset(&bin[0], 0, sizeof(size_t) * 2 * 3 * bin_size); }
 
-  std::vector<size_t> bin; // (min, max) * xyz * binsize
-  int binSize;
+  std::vector<size_t> bin;  // (min, max) * xyz * binsize
+  unsigned int bin_size;
+  unsigned int pad0;
 };
 
-inline float CalculateSurfaceArea(const float3 &min, const float3 &max) {
-  float3 box = max - min;
-  return 2.0f * (box[0] * box[1] + box[1] * box[2] + box[2] * box[0]);
+template <typename T>
+inline T CalculateSurfaceArea(const real3<T> &min, const real3<T> &max) {
+  real3<T> box = max - min;
+  return static_cast<T>(2.0) *
+         (box[0] * box[1] + box[1] * box[2] + box[2] * box[0]);
 }
 
-inline void GetBoundingBoxOfTriangle(float3 &bmin, float3 &bmax,
-                                     const float *vertices,
+template <typename T>
+inline void GetBoundingBoxOfTriangle(real3<T> *bmin, real3<T> *bmax,
+                                     const T *vertices,
                                      const unsigned int *faces,
                                      unsigned int index) {
   unsigned int f0 = faces[3 * index + 0];
   unsigned int f1 = faces[3 * index + 1];
   unsigned int f2 = faces[3 * index + 2];
 
-  float3 p[3];
+  real3<T> p[3];
 
-  p[0] = float3(&vertices[3 * f0]);
-  p[1] = float3(&vertices[3 * f1]);
-  p[2] = float3(&vertices[3 * f2]);
+  p[0] = real3<T>(&vertices[3 * f0]);
+  p[1] = real3<T>(&vertices[3 * f1]);
+  p[2] = real3<T>(&vertices[3 * f2]);
 
-  bmin = p[0];
-  bmax = p[0];
+  (*bmin) = p[0];
+  (*bmax) = p[0];
 
   for (int i = 1; i < 3; i++) {
-    bmin[0] = std::min(bmin[0], p[i][0]);
-    bmin[1] = std::min(bmin[1], p[i][1]);
-    bmin[2] = std::min(bmin[2], p[i][2]);
+    (*bmin)[0] = std::min((*bmin)[0], p[i][0]);
+    (*bmin)[1] = std::min((*bmin)[1], p[i][1]);
+    (*bmin)[2] = std::min((*bmin)[2], p[i][2]);
 
-    bmax[0] = std::max(bmax[0], p[i][0]);
-    bmax[1] = std::max(bmax[1], p[i][1]);
-    bmax[2] = std::max(bmax[2], p[i][2]);
+    (*bmax)[0] = std::max((*bmax)[0], p[i][0]);
+    (*bmax)[1] = std::max((*bmax)[1], p[i][1]);
+    (*bmax)[2] = std::max((*bmax)[2], p[i][2]);
   }
 }
 
-void ContributeBinBuffer(BinBuffer *bins, // [out]
-                         const float3 &sceneMin, const float3 &sceneMax,
-                         const float *vertices, const unsigned int *faces,
-                         unsigned int *indices, unsigned int leftIdx,
-                         unsigned int rightIdx, float epsScale) {
-  const float kEPS = std::numeric_limits<float>::epsilon() * epsScale;
-
-  float binSize = (float)bins->binSize;
+template <typename T, class P>
+inline void ContributeBinBuffer(BinBuffer *bins,  // [out]
+                                const real3<T> &scene_min,
+                                const real3<T> &scene_max,
+                                unsigned int *indices, unsigned int left_idx,
+                                unsigned int right_idx, const P &p) {
+  T bin_size = static_cast<T>(bins->bin_size);
 
   // Calculate extent
-  float3 sceneSize, sceneInvSize;
-  sceneSize = sceneMax - sceneMin;
-  for (int i = 0; i < 3; ++i) {
-    assert(sceneSize[i] >= 0.0);
+  real3<T> scene_size, scene_inv_size;
+  scene_size = scene_max - scene_min;
 
-    if (sceneSize[i] > kEPS) {
-      sceneInvSize[i] = binSize / sceneSize[i];
+  for (int i = 0; i < 3; ++i) {
+    assert(scene_size[i] >= static_cast<T>(0.0));
+
+    if (scene_size[i] > static_cast<T>(0.0)) {
+      scene_inv_size[i] = bin_size / scene_size[i];
     } else {
-      sceneInvSize[i] = 0.0;
+      scene_inv_size[i] = static_cast<T>(0.0);
     }
   }
 
   // Clear bin data
   std::fill(bins->bin.begin(), bins->bin.end(), 0);
-  // memset(&bins->bin[0], 0, sizeof(2 * 3 * bins->binSize));
+  // memset(&bins->bin[0], 0, sizeof(2 * 3 * bins->bin_size));
 
-  size_t idxBMin[3];
-  size_t idxBMax[3];
+  size_t idx_bmin[3];
+  size_t idx_bmax[3];
 
-  for (size_t i = leftIdx; i < rightIdx; i++) {
-
+  for (size_t i = left_idx; i < right_idx; i++) {
     //
     // Quantize the position into [0, BIN_SIZE)
     //
     // q[i] = (int)(p[i] - scene_bmin) / scene_size
     //
-    float3 bmin;
-    float3 bmax;
+    real3<T> bmin;
+    real3<T> bmax;
 
-    GetBoundingBoxOfTriangle(bmin, bmax, vertices, faces, indices[i]);
+    p.BoundingBox(&bmin, &bmax, indices[i]);
+    // GetBoundingBoxOfTriangle(&bmin, &bmax, vertices, faces, indices[i]);
 
-    float3 quantizedBMin = (bmin - sceneMin) * sceneInvSize;
-    float3 quantizedBMax = (bmax - sceneMin) * sceneInvSize;
+    real3<T> quantized_bmin = (bmin - scene_min) * scene_inv_size;
+    real3<T> quantized_bmax = (bmax - scene_min) * scene_inv_size;
 
     // idx is now in [0, BIN_SIZE)
     for (int j = 0; j < 3; ++j) {
-      int q0 = (int)quantizedBMin[j];
-      if (q0 < 0)
-        q0 = 0;
-      int q1 = (int)quantizedBMax[j];
-      if (q1 < 0)
-        q1 = 0;
+      int q0 = static_cast<int>(quantized_bmin[j]);
+      if (q0 < 0) q0 = 0;
+      int q1 = static_cast<int>(quantized_bmax[j]);
+      if (q1 < 0) q1 = 0;
 
-      idxBMin[j] = (unsigned int)q0;
-      idxBMax[j] = (unsigned int)q1;
+      idx_bmin[j] = static_cast<unsigned int>(q0);
+      idx_bmax[j] = static_cast<unsigned int>(q1);
 
-      if (idxBMin[j] >= binSize)
-        idxBMin[j] = (size_t)binSize - 1;
-      if (idxBMax[j] >= binSize)
-        idxBMax[j] = (size_t)binSize - 1;
+      if (idx_bmin[j] >= bin_size)
+        idx_bmin[j] = static_cast<unsigned int>(bin_size) - 1;
 
-      assert(idxBMin[j] < binSize);
-      assert(idxBMax[j] < binSize);
+      if (idx_bmax[j] >= bin_size)
+        idx_bmax[j] = static_cast<unsigned int>(bin_size) - 1;
 
       // Increment bin counter
-      bins->bin[0 * (bins->binSize * 3) + j * bins->binSize + idxBMin[j]] += 1;
-      bins->bin[1 * (bins->binSize * 3) + j * bins->binSize + idxBMax[j]] += 1;
+      bins->bin[0 * (bins->bin_size * 3) +
+                static_cast<size_t>(j) * bins->bin_size + idx_bmin[j]] += 1;
+      bins->bin[1 * (bins->bin_size * 3) +
+                static_cast<size_t>(j) * bins->bin_size + idx_bmax[j]] += 1;
     }
   }
 }
 
-inline float SAH(size_t ns1, float leftArea, size_t ns2, float rightArea,
-                 float invS, float Taabb, float Ttri) {
-  // const float Taabb = 0.2f;
-  // const float Ttri = 0.8f;
-  float T;
+template <typename T>
+inline T SAH(size_t ns1, T leftArea, size_t ns2, T rightArea, T invS, T Taabb,
+             T Ttri) {
+  T sah;
 
-  T = 2.0f * Taabb + (leftArea * invS) * (float)(ns1)*Ttri +
-      (rightArea * invS) * (float)(ns2)*Ttri;
+  sah = static_cast<T>(2.0) * Taabb +
+        (leftArea * invS) * static_cast<T>(ns1) * Ttri +
+        (rightArea * invS) * static_cast<T>(ns2) * Ttri;
 
-  return T;
+  return sah;
 }
 
-bool FindCutFromBinBuffer(float *cutPos,    // [out] xyz
-                          int &minCostAxis, // [out]
-                          const BinBuffer *bins, const float3 &bmin,
-                          const float3 &bmax, size_t numTriangles,
-                          float costTaabb, // should be in [0.0, 1.0]
-                          float epsScale) {
-  const float eps = std::numeric_limits<float>::epsilon() * epsScale;
+template <typename T>
+inline bool FindCutFromBinBuffer(T *cut_pos,        // [out] xyz
+                                 int *minCostAxis,  // [out]
+                                 const BinBuffer *bins, const real3<T> &bmin,
+                                 const real3<T> &bmax, size_t num_primitives,
+                                 T costTaabb) {      // should be in [0.0, 1.0]
+  const T kEPS = std::numeric_limits<T>::epsilon();  // * epsScale;
 
   size_t left, right;
-  float3 bsize, bstep;
-  float3 bminLeft, bmaxLeft;
-  float3 bminRight, bmaxRight;
-  float saLeft, saRight, saTotal;
-  float pos;
-  float minCost[3];
+  real3<T> bsize, bstep;
+  real3<T> bminLeft, bmaxLeft;
+  real3<T> bminRight, bmaxRight;
+  T saLeft, saRight, saTotal;
+  T pos;
+  T minCost[3];
 
-  float costTtri = 1.0f - costTaabb;
+  T costTtri = static_cast<T>(1.0) - costTaabb;
 
-  minCostAxis = 0;
+  (*minCostAxis) = 0;
 
   bsize = bmax - bmin;
-  bstep = bsize * (1.0f / bins->binSize);
+  bstep = bsize * (static_cast<T>(1.0) / bins->bin_size);
   saTotal = CalculateSurfaceArea(bmin, bmax);
 
-  float invSaTotal = 0.0f;
-  if (saTotal > eps) {
-    invSaTotal = 1.0f / saTotal;
+  T invSaTotal = static_cast<T>(0.0);
+  if (saTotal > kEPS) {
+    invSaTotal = static_cast<T>(1.0) / saTotal;
   }
 
   for (int j = 0; j < 3; ++j) {
-
     //
-    // Compute SAH cost for right side of each cell of the bbox.
-    // Exclude both extreme side of the bbox.
+    // Compute SAH cost for the right side of each cell of the bbox.
+    // Exclude both extreme sides of the bbox.
     //
     //  i:      0    1    2    3
     //     +----+----+----+----+----+
@@ -915,35 +1394,40 @@ bool FindCutFromBinBuffer(float *cutPos,    // [out] xyz
     //     +----+----+----+----+----+
     //
 
-    float minCostPos = bmin[j] + 0.5f * bstep[j];
-    minCost[j] = std::numeric_limits<float>::max();
+    T minCostPos = bmin[j] + static_cast<T>(1.0) * bstep[j];
+    minCost[j] = std::numeric_limits<T>::max();
 
     left = 0;
-    right = numTriangles;
+    right = num_primitives;
     bminLeft = bminRight = bmin;
     bmaxLeft = bmaxRight = bmax;
 
-    for (int i = 0; i < bins->binSize - 1; ++i) {
-      left += bins->bin[0 * (3 * bins->binSize) + j * bins->binSize + i];
-      right -= bins->bin[1 * (3 * bins->binSize) + j * bins->binSize + i];
+    for (int i = 0; i < static_cast<int>(bins->bin_size) - 1; ++i) {
+      left += bins->bin[0 * (3 * bins->bin_size) +
+                        static_cast<size_t>(j) * bins->bin_size +
+                        static_cast<size_t>(i)];
+      right -= bins->bin[1 * (3 * bins->bin_size) +
+                         static_cast<size_t>(j) * bins->bin_size +
+                         static_cast<size_t>(i)];
 
-      assert(left <= numTriangles);
-      assert(right <= numTriangles);
+      assert(left <= num_primitives);
+      assert(right <= num_primitives);
 
       //
       // Split pos bmin + (i + 1) * (bsize / BIN_SIZE)
       // +1 for i since we want a position on right side of the cell.
       //
 
-      pos = bmin[j] + (i + 0.5f) * bstep[j];
+      pos = bmin[j] + (i + static_cast<T>(1.0)) * bstep[j];
       bmaxLeft[j] = pos;
       bminRight[j] = pos;
 
       saLeft = CalculateSurfaceArea(bminLeft, bmaxLeft);
       saRight = CalculateSurfaceArea(bminRight, bmaxRight);
 
-      float cost =
+      T cost =
           SAH(left, saLeft, right, saRight, invSaTotal, costTaabb, costTtri);
+
       if (cost < minCost[j]) {
         //
         // Update the min cost
@@ -954,195 +1438,188 @@ bool FindCutFromBinBuffer(float *cutPos,    // [out] xyz
       }
     }
 
-    cutPos[j] = minCostPos;
+    cut_pos[j] = minCostPos;
   }
 
-  // cutAxis = minCostAxis;
-  // cutPos = minCostPos;
+  // cut_axis = minCostAxis;
+  // cut_pos = minCostPos;
 
   // Find min cost axis
-  float cost = minCost[0];
-  minCostAxis = 0;
+  T cost = minCost[0];
+  (*minCostAxis) = 0;
+
   if (cost > minCost[1]) {
-    minCostAxis = 1;
+    (*minCostAxis) = 1;
     cost = minCost[1];
   }
   if (cost > minCost[2]) {
-    minCostAxis = 2;
+    (*minCostAxis) = 2;
     cost = minCost[2];
   }
 
   return true;
 }
 
-class SAHPred : public std::unary_function<unsigned int, bool> {
-public:
-  SAHPred(int axis, float pos, const float *vertices, const unsigned int *faces)
-      : axis_(axis), pos_(pos), vertices_(vertices), faces_(faces) {}
-
-  bool operator()(unsigned int i) const {
-    int axis = axis_;
-    float pos = pos_;
-
-    unsigned int i0 = faces_[3 * i + 0];
-    unsigned int i1 = faces_[3 * i + 1];
-    unsigned int i2 = faces_[3 * i + 2];
-
-    float3 p0(&vertices_[3 * i0]);
-    float3 p1(&vertices_[3 * i1]);
-    float3 p2(&vertices_[3 * i2]);
-
-    float center = p0[axis] + p1[axis] + p2[axis];
-
-    return (center < pos * 3.0f);
-  }
-
-private:
-  int axis_;
-  float pos_;
-  const float *vertices_;
-  const unsigned int *faces_;
-};
-
 #ifdef _OPENMP
-void ComputeBoundingBoxOMP(float3 &bmin, float3 &bmax, const float *vertices,
-                           const unsigned int *faces, unsigned int *indices,
-                           unsigned int leftIndex, unsigned int rightIndex,
-                           float epsScale) {
-  const float kEPS = std::numeric_limits<float>::epsilon() * epsScale;
+template <typename T, class P>
+void ComputeBoundingBoxOMP(real3<T> *bmin, real3<T> *bmax,
+                           const unsigned int *indices, unsigned int left_index,
+                           unsigned int right_index, const P &p) {
+  { p.BoundingBox(bmin, bmax, indices[left_index]); }
 
-  long long i = leftIndex;
-  long long idx = indices[i];
-  long long n = rightIndex - leftIndex;
-  bmin[0] = vertices[3 * faces[3 * idx + 0] + 0] - kEPS;
-  bmin[1] = vertices[3 * faces[3 * idx + 0] + 1] - kEPS;
-  bmin[2] = vertices[3 * faces[3 * idx + 0] + 2] - kEPS;
-  bmax[0] = vertices[3 * faces[3 * idx + 0] + 0] + kEPS;
-  bmax[1] = vertices[3 * faces[3 * idx + 0] + 1] + kEPS;
-  bmax[2] = vertices[3 * faces[3 * idx + 0] + 2] + kEPS;
+  T local_bmin[3] = {(*bmin)[0], (*bmin)[1], (*bmin)[2]};
+  T local_bmax[3] = {(*bmax)[0], (*bmax)[1], (*bmax)[2]};
 
-  float local_bmin[3] = {bmin[0], bmin[1], bmin[2]};
-  float local_bmax[3] = {bmax[0], bmax[1], bmax[2]};
+  unsigned int n = right_index - left_index;
 
 #pragma omp parallel firstprivate(local_bmin, local_bmax) if (n > (1024 * 128))
   {
+#pragma omp parallel for
+    // for each face
+    for (int i = int(left_index); i < int(right_index); i++) {
+      unsigned int idx = indices[i];
 
-#pragma omp for
-    for (i = leftIndex; i < rightIndex; i++) { // for each faces
-      size_t idx = indices[i];
-      for (int j = 0; j < 3; j++) { // for each face vertex
-        size_t fid = faces[3 * idx + j];
-        for (int k = 0; k < 3; k++) { // xyz
-          float minval = vertices[3 * fid + k] - kEPS;
-          float maxval = vertices[3 * fid + k] + kEPS;
-          if (local_bmin[k] > minval)
-            local_bmin[k] = minval;
-          if (local_bmax[k] < maxval)
-            local_bmax[k] = maxval;
-        }
+      real3<T> bbox_min, bbox_max;
+
+      p.BoundingBox(&bbox_min, &bbox_max, idx);
+
+      // xyz
+      for (int k = 0; k < 3; k++) {
+        (*bmin)[k] = std::min((*bmin)[k], bbox_min[k]);
+        (*bmax)[k] = std::max((*bmax)[k], bbox_max[k]);
       }
     }
 
 #pragma omp critical
     {
       for (int k = 0; k < 3; k++) {
-
-        if (local_bmin[k] < bmin[k]) {
-          {
-            if (local_bmin[k] < bmin[k])
-              bmin[k] = local_bmin[k];
-          }
-        }
-
-        if (local_bmax[k] > bmax[k]) {
-          {
-            if (local_bmax[k] > bmax[k])
-              bmax[k] = local_bmax[k];
-          }
-        }
+        (*bmin)[k] = std::min((*bmin)[k], local_bmin[k]);
+        (*bmax)[k] = std::max((*bmax)[k], local_bmax[k]);
       }
     }
   }
 }
 #endif
 
-void ComputeBoundingBox(float3 &bmin, float3 &bmax, const float *vertices,
-                        const unsigned int *faces, unsigned int *indices,
-                        unsigned int leftIndex, unsigned int rightIndex,
-                        float epsScale) {
-  const float kEPS = std::numeric_limits<float>::epsilon() * epsScale;
+#ifdef NANORT_USE_CPP11_FEATURE
+template <typename T, class P>
+inline void ComputeBoundingBoxThreaded(real3<T> *bmin, real3<T> *bmax,
+                                       const unsigned int *indices,
+                                       unsigned int left_index,
+                                       unsigned int right_index, const P &p) {
+  unsigned int n = right_index - left_index;
 
-  long long i = leftIndex;
-  long long idx = indices[i];
-  bmin[0] = vertices[3 * faces[3 * idx + 0] + 0] - kEPS;
-  bmin[1] = vertices[3 * faces[3 * idx + 0] + 1] - kEPS;
-  bmin[2] = vertices[3 * faces[3 * idx + 0] + 2] - kEPS;
-  bmax[0] = vertices[3 * faces[3 * idx + 0] + 0] + kEPS;
-  bmax[1] = vertices[3 * faces[3 * idx + 0] + 1] + kEPS;
-  bmax[2] = vertices[3 * faces[3 * idx + 0] + 2] + kEPS;
+  size_t num_threads = std::min(
+      size_t(kNANORT_MAX_THREADS),
+      std::max(size_t(1), size_t(std::thread::hardware_concurrency())));
 
-  float local_bmin[3] = {bmin[0], bmin[1], bmin[2]};
-  float local_bmax[3] = {bmax[0], bmax[1], bmax[2]};
+  if (n < num_threads) {
+    num_threads = n;
+  }
 
-  {
+  std::vector<std::thread> workers;
 
-    for (i = leftIndex; i < rightIndex; i++) { // for each faces
-      size_t idx = indices[i];
-      for (int j = 0; j < 3; j++) { // for each face vertex
-        size_t fid = faces[3 * idx + j];
-        for (int k = 0; k < 3; k++) { // xyz
-          float minval = vertices[3 * fid + k] - kEPS;
-          float maxval = vertices[3 * fid + k] + kEPS;
-          if (local_bmin[k] > minval)
-            local_bmin[k] = minval;
-          if (local_bmax[k] < maxval)
-            local_bmax[k] = maxval;
+  size_t ndiv = n / num_threads;
+
+  std::vector<T> local_bmins(3 * num_threads);  // 3 = xyz
+  std::vector<T> local_bmaxs(3 * num_threads);  // 3 = xyz
+
+  for (size_t t = 0; t < num_threads; t++) {
+    workers.emplace_back(std::thread([&, t]() {
+      size_t si = left_index + t * ndiv;
+      size_t ei = (t == (num_threads - 1)) ? size_t(right_index) : std::min(left_index + (t + 1) * ndiv, size_t(right_index));
+
+      local_bmins[3 * t + 0] = std::numeric_limits<T>::infinity();
+      local_bmins[3 * t + 1] = std::numeric_limits<T>::infinity();
+      local_bmins[3 * t + 2] = std::numeric_limits<T>::infinity();
+      local_bmaxs[3 * t + 0] = -std::numeric_limits<T>::infinity();
+      local_bmaxs[3 * t + 1] = -std::numeric_limits<T>::infinity();
+      local_bmaxs[3 * t + 2] = -std::numeric_limits<T>::infinity();
+
+      // for each face
+      for (size_t i = si; i < ei; i++) {
+        unsigned int idx = indices[i];
+
+        real3<T> bbox_min, bbox_max;
+        p.BoundingBox(&bbox_min, &bbox_max, idx);
+
+        // xyz
+        for (size_t k = 0; k < 3; k++) {
+          local_bmins[3 * t + k] =
+              std::min(local_bmins[3 * t + k], bbox_min[int(k)]);
+          local_bmaxs[3 * t + k] =
+              std::max(local_bmaxs[3 * t + k], bbox_max[int(k)]);
         }
       }
-    }
+    }));
+  }
 
-    for (int k = 0; k < 3; k++) {
-      bmin[k] = local_bmin[k];
-      bmax[k] = local_bmax[k];
+  for (auto &t : workers) {
+    t.join();
+  }
+
+  // merge bbox
+  for (size_t k = 0; k < 3; k++) {
+    (*bmin)[int(k)] = local_bmins[k];
+    (*bmax)[int(k)] = local_bmaxs[k];
+  }
+
+  for (size_t t = 1; t < num_threads; t++) {
+    for (size_t k = 0; k < 3; k++) {
+      (*bmin)[int(k)] = std::min((*bmin)[int(k)], local_bmins[3 * t + k]);
+      (*bmax)[int(k)] = std::max((*bmax)[int(k)], local_bmaxs[3 * t + k]);
+    }
+  }
+}
+#endif
+
+template <typename T, class P>
+inline void ComputeBoundingBox(real3<T> *bmin, real3<T> *bmax,
+                               const unsigned int *indices,
+                               unsigned int left_index,
+                               unsigned int right_index, const P &p) {
+  unsigned int idx = indices[left_index];
+  p.BoundingBox(bmin, bmax, idx);
+
+  {
+    // for each primitive
+    for (unsigned int i = left_index + 1; i < right_index; i++) {
+      idx = indices[i];
+      real3<T> bbox_min, bbox_max;
+      p.BoundingBox(&bbox_min, &bbox_max, idx);
+
+      // xyz
+      for (int k = 0; k < 3; k++) {
+        (*bmin)[k] = std::min((*bmin)[k], bbox_min[k]);
+        (*bmax)[k] = std::max((*bmax)[k], bbox_max[k]);
+      }
     }
   }
 }
 
-void GetBoundingBox(float3 &bmin, float3 &bmax, std::vector<BBox> &bboxes,
-                    unsigned int *indices, unsigned int leftIndex,
-                    unsigned int rightIndex, float epsScale) {
-  const float kEPS = std::numeric_limits<float>::epsilon() * epsScale;
+template <typename T>
+inline void GetBoundingBox(real3<T> *bmin, real3<T> *bmax,
+                           const std::vector<BBox<T> > &bboxes,
+                           unsigned int *indices, unsigned int left_index,
+                           unsigned int right_index) {
+  unsigned int i = left_index;
+  unsigned int idx = indices[i];
 
-  long long i = leftIndex;
-  long long idx = indices[i];
-  bmin[0] = bboxes[idx].bmin[0] - kEPS;
-  bmin[1] = bboxes[idx].bmin[1] - kEPS;
-  bmin[2] = bboxes[idx].bmin[2] - kEPS;
-  bmax[0] = bboxes[idx].bmax[0] + kEPS;
-  bmax[1] = bboxes[idx].bmax[1] + kEPS;
-  bmax[2] = bboxes[idx].bmax[2] + kEPS;
+  (*bmin)[0] = bboxes[idx].bmin[0];
+  (*bmin)[1] = bboxes[idx].bmin[1];
+  (*bmin)[2] = bboxes[idx].bmin[2];
+  (*bmax)[0] = bboxes[idx].bmax[0];
+  (*bmax)[1] = bboxes[idx].bmax[1];
+  (*bmax)[2] = bboxes[idx].bmax[2];
 
-  float local_bmin[3] = {bmin[0], bmin[1], bmin[2]};
-  float local_bmax[3] = {bmax[0], bmax[1], bmax[2]};
+  // for each face
+  for (i = left_index + 1; i < right_index; i++) {
+    idx = indices[i];
 
-  {
-
-    for (i = leftIndex; i < rightIndex; i++) { // for each faces
-      size_t idx = indices[i];
-
-      for (int k = 0; k < 3; k++) { // xyz
-        float minval = bboxes[idx].bmin[k] - kEPS;
-        float maxval = bboxes[idx].bmax[k] + kEPS;
-        if (local_bmin[k] > minval)
-          local_bmin[k] = minval;
-        if (local_bmax[k] < maxval)
-          local_bmax[k] = maxval;
-      }
-    }
-
+    // xyz
     for (int k = 0; k < 3; k++) {
-      bmin[k] = local_bmin[k];
-      bmax[k] = local_bmax[k];
+      (*bmin)[k] = std::min((*bmin)[k], bboxes[idx].bmin[k]);
+      (*bmax)[k] = std::max((*bmax)[k], bboxes[idx].bmax[k]);
     }
   }
 }
@@ -1151,29 +1628,37 @@ void GetBoundingBox(float3 &bmin, float3 &bmax, std::vector<BBox> &bboxes,
 // --
 //
 
-#if NANORT_ENABLE_PARALLEL_BUILD
-unsigned int BVHAccel::BuildShallowTree(std::vector<BVHNode> &outNodes,
-                                        const float *vertices,
-                                        const unsigned int *faces,
-                                        unsigned int leftIdx,
-                                        unsigned int rightIdx, int depth,
-                                        int maxShallowDepth, float epsScale) {
-  assert(leftIdx <= rightIdx);
+#if defined(NANORT_ENABLE_PARALLEL_BUILD)
+template <typename T>
+template <class P, class Pred>
+unsigned int BVHAccel<T>::BuildShallowTree(std::vector<BVHNode<T> > *out_nodes,
+                                           unsigned int left_idx,
+                                           unsigned int right_idx,
+                                           unsigned int depth,
+                                           unsigned int max_shallow_depth,
+                                           const P &p, const Pred &pred) {
+  assert(left_idx <= right_idx);
 
-  unsigned int offset = outNodes.size();
+  unsigned int offset = static_cast<unsigned int>(out_nodes->size());
 
-  if (stats_.maxTreeDepth < depth) {
-    stats_.maxTreeDepth = depth;
+  if (stats_.max_tree_depth < depth) {
+    stats_.max_tree_depth = depth;
   }
 
-  float3 bmin, bmax;
-  ComputeBoundingBox(bmin, bmax, vertices, faces, &indices_.at(0), leftIdx,
-                     rightIdx, epsScale);
+  real3<T> bmin, bmax;
 
-  long long n = rightIdx - leftIdx;
-  if ((n < options_.minLeafPrimitives) || (depth >= options_.maxTreeDepth)) {
+#if defined(NANORT_USE_CPP11_FEATURE) && defined(NANORT_ENABLE_PARALLEL_BUILD)
+  ComputeBoundingBoxThreaded(&bmin, &bmax, &indices_.at(0), left_idx, right_idx,
+                             p);
+#else
+  ComputeBoundingBox(&bmin, &bmax, &indices_.at(0), left_idx, right_idx, p);
+#endif
+
+  unsigned int n = right_idx - left_idx;
+  if ((n <= options_.min_leaf_primitives) ||
+      (depth >= options_.max_tree_depth)) {
     // Create leaf node.
-    BVHNode leaf;
+    BVHNode<T> leaf;
 
     leaf.bmin[0] = bmin[0];
     leaf.bmin[1] = bmin[1];
@@ -1183,15 +1668,15 @@ unsigned int BVHAccel::BuildShallowTree(std::vector<BVHNode> &outNodes,
     leaf.bmax[1] = bmax[1];
     leaf.bmax[2] = bmax[2];
 
-    assert(leftIdx < std::numeric_limits<unsigned int>::max());
+    assert(left_idx < std::numeric_limits<unsigned int>::max());
 
-    leaf.flag = 1; // leaf
+    leaf.flag = 1;  // leaf
     leaf.data[0] = n;
-    leaf.data[1] = (unsigned int)leftIdx;
+    leaf.data[1] = left_idx;
 
-    outNodes.push_back(leaf); // atomic update
+    out_nodes->push_back(leaf);  // atomic update
 
-    stats_.numLeafNodes++;
+    stats_.num_leaf_nodes++;
 
     return offset;
   }
@@ -1199,147 +1684,137 @@ unsigned int BVHAccel::BuildShallowTree(std::vector<BVHNode> &outNodes,
   //
   // Create branch node.
   //
-  if (depth >= maxShallowDepth) {
-
+  if (depth >= max_shallow_depth) {
     // Delay to build tree
     ShallowNodeInfo info;
-    info.leftIdx = leftIdx;
-    info.rightIdx = rightIdx;
+    info.left_idx = left_idx;
+    info.right_idx = right_idx;
     info.offset = offset;
-    shallowNodeInfos_.push_back(info);
+    shallow_node_infos_.push_back(info);
 
     // Add dummy node.
-    BVHNode node;
+    BVHNode<T> node;
     node.axis = -1;
     node.flag = -1;
-    outNodes.push_back(node);
+    out_nodes->push_back(node);
 
     return offset;
 
   } else {
+    //
+    // TODO(LTE): multi-threaded SAH computation, or use simple object median or
+    // spacial median for shallow tree to speeding up the parallel build.
+    //
 
     //
     // Compute SAH and find best split axis and position
     //
-    int minCutAxis = 0;
-    float cutPos[3] = {0.0, 0.0, 0.0};
+    int min_cut_axis = 0;
+    T cut_pos[3] = {0.0, 0.0, 0.0};
 
-    BinBuffer bins(options_.binSize);
-    ContributeBinBuffer(&bins, bmin, bmax, vertices, faces, &indices_.at(0),
-                        leftIdx, rightIdx, epsScale);
-    FindCutFromBinBuffer(cutPos, minCutAxis, &bins, bmin, bmax, n,
-                         options_.costTaabb, epsScale);
+    BinBuffer bins(options_.bin_size);
+    ContributeBinBuffer(&bins, bmin, bmax, &indices_.at(0), left_idx, right_idx,
+                        p);
+    FindCutFromBinBuffer(cut_pos, &min_cut_axis, &bins, bmin, bmax, n,
+                         options_.cost_t_aabb);
 
     // Try all 3 axis until good cut position avaiable.
-    unsigned int midIdx;
-    int cutAxis = minCutAxis;
-    for (int axisTry = 0; axisTry < 1; axisTry++) {
+    unsigned int mid_idx = left_idx;
+    int cut_axis = min_cut_axis;
 
-      unsigned int *begin = &indices_[leftIdx];
-      unsigned int *end = &indices_[rightIdx - 1] + 1; // mimics end() iterator.
+    for (int axis_try = 0; axis_try < 3; axis_try++) {
+      unsigned int *begin = &indices_[left_idx];
+      unsigned int *end =
+          &indices_[right_idx - 1] + 1;  // mimics end() iterator
       unsigned int *mid = 0;
 
-      // try minCutAxis first.
-      cutAxis = (minCutAxis + axisTry) % 3;
+      // try min_cut_axis first.
+      cut_axis = (min_cut_axis + axis_try) % 3;
 
+      pred.Set(cut_axis, cut_pos[cut_axis]);
       //
-      // Split at (cutAxis, cutPos)
+      // Split at (cut_axis, cut_pos)
       // indices_ will be modified.
       //
-      mid = std::partition(begin, end,
-                           SAHPred(cutAxis, cutPos[cutAxis], vertices, faces));
+      mid = std::partition(begin, end, pred);
 
-      midIdx = leftIdx + (mid - begin);
-      if ((midIdx == leftIdx) || (midIdx == rightIdx)) {
+      mid_idx = left_idx + static_cast<unsigned int>((mid - begin));
 
+      if ((mid_idx == left_idx) || (mid_idx == right_idx)) {
         // Can't split well.
-        // Switch to object median(which may create unoptimized tree, but
+        // Switch to object median (which may create unoptimized tree, but
         // stable)
-        midIdx = leftIdx + (n >> 1);
+        mid_idx = left_idx + (n >> 1);
 
-        // Try another axis if there's axis to try.
+        // Try another axis if there's an axis to try.
 
       } else {
-
         // Found good cut. exit loop.
         break;
       }
     }
 
-    BVHNode node;
-    node.axis = cutAxis;
-    node.flag = 0; // 0 = branch
+    BVHNode<T> node;
+    node.axis = cut_axis;
+    node.flag = 0;  // 0 = branch
 
-    outNodes.push_back(node);
+    out_nodes->push_back(node);
 
-    unsigned int leftChildIndex = 0;
-    unsigned int rightChildIndex = 0;
+    unsigned int left_child_index = 0;
+    unsigned int right_child_index = 0;
 
-    leftChildIndex =
-        BuildShallowTree(outNodes, vertices, faces, leftIdx, midIdx, depth + 1,
-                         maxShallowDepth, epsScale);
+    left_child_index = BuildShallowTree(out_nodes, left_idx, mid_idx, depth + 1,
+                                        max_shallow_depth, p, pred);
 
-    rightChildIndex =
-        BuildShallowTree(outNodes, vertices, faces, midIdx, rightIdx, depth + 1,
-                         maxShallowDepth, epsScale);
+    right_child_index = BuildShallowTree(out_nodes, mid_idx, right_idx,
+                                         depth + 1, max_shallow_depth, p, pred);
 
-    if ((leftChildIndex != (unsigned int)(-1)) &&
-        (rightChildIndex != (unsigned int)(-1))) {
-      outNodes[offset].data[0] = leftChildIndex;
-      outNodes[offset].data[1] = rightChildIndex;
+    //std::cout << "shallow[" << offset << "] l and r = " << left_child_index << ", " << right_child_index << std::endl;
+    (*out_nodes)[offset].data[0] = left_child_index;
+    (*out_nodes)[offset].data[1] = right_child_index;
 
-      outNodes[offset].bmin[0] = bmin[0];
-      outNodes[offset].bmin[1] = bmin[1];
-      outNodes[offset].bmin[2] = bmin[2];
+    (*out_nodes)[offset].bmin[0] = bmin[0];
+    (*out_nodes)[offset].bmin[1] = bmin[1];
+    (*out_nodes)[offset].bmin[2] = bmin[2];
 
-      outNodes[offset].bmax[0] = bmax[0];
-      outNodes[offset].bmax[1] = bmax[1];
-      outNodes[offset].bmax[2] = bmax[2];
-    } else {
-      if ((leftChildIndex == (unsigned int)(-1)) &&
-          (rightChildIndex != (unsigned int)(-1))) {
-        fprintf(stderr, "??? : %u, %u\n", leftChildIndex, rightChildIndex);
-        exit(-1);
-      } else if ((leftChildIndex != (unsigned int)(-1)) &&
-                 (rightChildIndex == (unsigned int)(-1))) {
-        fprintf(stderr, "??? : %u, %u\n", leftChildIndex, rightChildIndex);
-        exit(-1);
-      }
-    }
+    (*out_nodes)[offset].bmax[0] = bmax[0];
+    (*out_nodes)[offset].bmax[1] = bmax[1];
+    (*out_nodes)[offset].bmax[2] = bmax[2];
   }
 
-  stats_.numBranchNodes++;
+  stats_.num_branch_nodes++;
 
   return offset;
 }
 #endif
 
-size_t BVHAccel::BuildTree(BVHBuildStatistics &outStat,
-                           std::vector<BVHNode> &outNodes,
-                           const float *vertices, const unsigned int *faces,
-                           unsigned int leftIdx, unsigned int rightIdx,
-                           int depth, float epsScale) {
-  assert(leftIdx <= rightIdx);
+template <typename T>
+template <class P, class Pred>
+unsigned int BVHAccel<T>::BuildTree(BVHBuildStatistics *out_stat,
+                                    std::vector<BVHNode<T> > *out_nodes,
+                                    unsigned int left_idx,
+                                    unsigned int right_idx, unsigned int depth,
+                                    const P &p, const Pred &pred) {
+  assert(left_idx <= right_idx);
 
-  size_t offset = outNodes.size();
+  unsigned int offset = static_cast<unsigned int>(out_nodes->size());
 
-  if (outStat.maxTreeDepth < depth) {
-    outStat.maxTreeDepth = depth;
+  if (out_stat->max_tree_depth < depth) {
+    out_stat->max_tree_depth = depth;
   }
 
-  float3 bmin, bmax;
+  real3<T> bmin, bmax;
   if (!bboxes_.empty()) {
-    GetBoundingBox(bmin, bmax, bboxes_, &indices_.at(0), leftIdx, rightIdx,
-                   epsScale);
+    GetBoundingBox(&bmin, &bmax, bboxes_, &indices_.at(0), left_idx, right_idx);
   } else {
-    ComputeBoundingBox(bmin, bmax, vertices, faces, &indices_.at(0), leftIdx,
-                       rightIdx, epsScale);
+    ComputeBoundingBox(&bmin, &bmax, &indices_.at(0), left_idx, right_idx, p);
   }
 
-  long long n = rightIdx - leftIdx;
-  if ((n < options_.minLeafPrimitives) || (depth >= options_.maxTreeDepth)) {
+  unsigned int n = right_idx - left_idx;
+  if ((n <= options_.min_leaf_primitives) ||
+      (depth >= options_.max_tree_depth)) {
     // Create leaf node.
-    BVHNode leaf;
+    BVHNode<T> leaf;
 
     leaf.bmin[0] = bmin[0];
     leaf.bmin[1] = bmin[1];
@@ -1349,15 +1824,15 @@ size_t BVHAccel::BuildTree(BVHBuildStatistics &outStat,
     leaf.bmax[1] = bmax[1];
     leaf.bmax[2] = bmax[2];
 
-    assert(leftIdx < std::numeric_limits<unsigned int>::max());
+    assert(left_idx < std::numeric_limits<unsigned int>::max());
 
-    leaf.flag = 1; // leaf
-    leaf.data[0] = (unsigned int)n;
-    leaf.data[1] = (unsigned int)leftIdx;
+    leaf.flag = 1;  // leaf
+    leaf.data[0] = n;
+    leaf.data[1] = left_idx;
 
-    outNodes.push_back(leaf); // atomic update
+    out_nodes->push_back(leaf);  // atomic update
 
-    outStat.numLeafNodes++;
+    out_stat->num_leaf_nodes++;
 
     return offset;
   }
@@ -1369,209 +1844,305 @@ size_t BVHAccel::BuildTree(BVHBuildStatistics &outStat,
   //
   // Compute SAH and find best split axis and position
   //
-  int minCutAxis = 0;
-  float cutPos[3] = {0.0, 0.0, 0.0};
+  int min_cut_axis = 0;
+  T cut_pos[3] = {0.0, 0.0, 0.0};
 
-  BinBuffer bins(options_.binSize);
-  ContributeBinBuffer(&bins, bmin, bmax, vertices, faces, &indices_.at(0),
-                      leftIdx, rightIdx, epsScale);
-  FindCutFromBinBuffer(cutPos, minCutAxis, &bins, bmin, bmax, n,
-                       options_.costTaabb, epsScale);
+  BinBuffer bins(options_.bin_size);
+  ContributeBinBuffer(&bins, bmin, bmax, &indices_.at(0), left_idx, right_idx,
+                      p);
+  FindCutFromBinBuffer(cut_pos, &min_cut_axis, &bins, bmin, bmax, n,
+                       options_.cost_t_aabb);
 
   // Try all 3 axis until good cut position avaiable.
-  unsigned int midIdx;
-  int cutAxis = minCutAxis;
-  for (int axisTry = 0; axisTry < 1; axisTry++) {
+  unsigned int mid_idx = left_idx;
+  int cut_axis = min_cut_axis;
 
-    unsigned int *begin = &indices_[leftIdx];
-    unsigned int *end = &indices_[rightIdx - 1] + 1; // mimics end() iterator.
+  for (int axis_try = 0; axis_try < 3; axis_try++) {
+    unsigned int *begin = &indices_[left_idx];
+    unsigned int *end = &indices_[right_idx - 1] + 1;  // mimics end() iterator.
     unsigned int *mid = 0;
 
-    // try minCutAxis first.
-    cutAxis = (minCutAxis + axisTry) % 3;
+    // try min_cut_axis first.
+    cut_axis = (min_cut_axis + axis_try) % 3;
+
+    pred.Set(cut_axis, cut_pos[cut_axis]);
 
     //
-    // Split at (cutAxis, cutPos)
+    // Split at (cut_axis, cut_pos)
     // indices_ will be modified.
     //
-    mid = std::partition(begin, end,
-                         SAHPred(cutAxis, cutPos[cutAxis], vertices, faces));
+    mid = std::partition(begin, end, pred);
 
-    midIdx = leftIdx + (unsigned int)(mid - begin);
-    if ((midIdx == leftIdx) || (midIdx == rightIdx)) {
+    mid_idx = left_idx + static_cast<unsigned int>((mid - begin));
 
+    if ((mid_idx == left_idx) || (mid_idx == right_idx)) {
       // Can't split well.
       // Switch to object median(which may create unoptimized tree, but
       // stable)
-      midIdx = leftIdx + (unsigned int)(n >> 1);
+      mid_idx = left_idx + (n >> 1);
 
-      // Try another axis if there's axis to try.
+      // Try another axis to find better cut.
 
     } else {
-
       // Found good cut. exit loop.
       break;
     }
   }
 
-  BVHNode node;
-  node.axis = cutAxis;
-  node.flag = 0; // 0 = branch
+  BVHNode<T> node;
+  node.axis = cut_axis;
+  node.flag = 0;  // 0 = branch
 
-  outNodes.push_back(node); // atomic update
+  out_nodes->push_back(node);
 
-  unsigned int leftChildIndex = 0;
-  unsigned int rightChildIndex = 0;
+  unsigned int left_child_index = 0;
+  unsigned int right_child_index = 0;
 
-  leftChildIndex = (unsigned int)BuildTree(outStat, outNodes, vertices, faces, leftIdx,
-                             midIdx, depth + 1, epsScale);
+  left_child_index =
+      BuildTree(out_stat, out_nodes, left_idx, mid_idx, depth + 1, p, pred);
 
-  rightChildIndex = (unsigned int)BuildTree(outStat, outNodes, vertices, faces, midIdx,
-                              rightIdx, depth + 1, epsScale);
+  right_child_index =
+      BuildTree(out_stat, out_nodes, mid_idx, right_idx, depth + 1, p, pred);
 
   {
-    outNodes[offset].data[0] = leftChildIndex;
-    outNodes[offset].data[1] = rightChildIndex;
+    (*out_nodes)[offset].data[0] = left_child_index;
+    (*out_nodes)[offset].data[1] = right_child_index;
 
-    outNodes[offset].bmin[0] = bmin[0];
-    outNodes[offset].bmin[1] = bmin[1];
-    outNodes[offset].bmin[2] = bmin[2];
+    (*out_nodes)[offset].bmin[0] = bmin[0];
+    (*out_nodes)[offset].bmin[1] = bmin[1];
+    (*out_nodes)[offset].bmin[2] = bmin[2];
 
-    outNodes[offset].bmax[0] = bmax[0];
-    outNodes[offset].bmax[1] = bmax[1];
-    outNodes[offset].bmax[2] = bmax[2];
+    (*out_nodes)[offset].bmax[0] = bmax[0];
+    (*out_nodes)[offset].bmax[1] = bmax[1];
+    (*out_nodes)[offset].bmax[2] = bmax[2];
   }
 
-  outStat.numBranchNodes++;
+  out_stat->num_branch_nodes++;
 
   return offset;
 }
 
-bool BVHAccel::Build(const float *vertices, const unsigned int *faces,
-                     unsigned int numFaces, const BVHBuildOptions &options) {
+template <typename T>
+template <class Prim, class Pred>
+bool BVHAccel<T>::Build(unsigned int num_primitives, const Prim &p,
+                        const Pred &pred, const BVHBuildOptions<T> &options) {
   options_ = options;
   stats_ = BVHBuildStatistics();
 
-  assert(options_.binSize > 1);
+  nodes_.clear();
+  bboxes_.clear();
+#if defined(NANORT_ENABLE_PARALLEL_BUILD)
+  shallow_node_infos_.clear();
+#endif
 
-  size_t n = numFaces;
+  assert(options_.bin_size > 1);
+
+  if (num_primitives == 0) {
+    return false;
+  }
+
+  unsigned int n = num_primitives;
 
   //
   // 1. Create triangle indices(this will be permutated in BuildTree)
   //
   indices_.resize(n);
 
+#if defined(NANORT_USE_CPP11_FEATURE)
+  {
+    size_t num_threads = std::min(
+        size_t(kNANORT_MAX_THREADS),
+        std::max(size_t(1), size_t(std::thread::hardware_concurrency())));
+
+    if (n < num_threads) {
+      num_threads = n;
+    }
+
+    std::vector<std::thread> workers;
+
+    size_t ndiv = n / num_threads;
+
+    for (size_t t = 0; t < num_threads; t++) {
+      workers.emplace_back(std::thread([&, t]() {
+        size_t si = t * ndiv;
+        size_t ei = (t == (num_threads - 1)) ? n : std::min((t + 1) * ndiv, size_t(n));
+
+        for (size_t k = si; k < ei; k++) {
+          indices_[k] = static_cast<unsigned int>(k);
+        }
+      }));
+    }
+
+    for (auto &t : workers) {
+      t.join();
+    }
+  }
+
+#else
+
 #ifdef _OPENMP
 #pragma omp parallel for
 #endif
-  for (long long i = 0; i < (long long)n; i++) {
-    indices_[i] = (unsigned int)i;
+  for (int i = 0; i < static_cast<int>(n); i++) {
+    indices_[static_cast<size_t>(i)] = static_cast<unsigned int>(i);
   }
+#endif  // !NANORT_USE_CPP11_FEATURE
 
   //
-  // 2. Compute bounding box to find scene scale.
+  // 2. Compute bounding box (optional).
   //
-  float epsScale = 1.0f;
-  float3 bmin, bmax;
-  if (options.cacheBBox) {
+  real3<T> bmin, bmax;
 
-    bmin[0] = bmin[1] = bmin[2] = std::numeric_limits<float>::max();
-    bmax[0] = bmax[1] = bmax[2] = -std::numeric_limits<float>::max();
+  if (options.cache_bbox) {
+    bmin[0] = bmin[1] = bmin[2] = std::numeric_limits<T>::max();
+    bmax[0] = bmax[1] = bmax[2] = -std::numeric_limits<T>::max();
 
     bboxes_.resize(n);
-    for (size_t i = 0; i < n; i++) { // for each faces
-      size_t idx = indices_[i];
 
-      BBox bbox;
-      for (int j = 0; j < 3; j++) { // for each face vertex
-        size_t fid = faces[3 * idx + j];
-        for (int k = 0; k < 3; k++) { // xyz
-          float minval = vertices[3 * fid + k];
-          float maxval = vertices[3 * fid + k];
-          if (bbox.bmin[k] > minval) {
-            bbox.bmin[k] = minval;
-          }
-          if (bbox.bmax[k] < maxval) {
-            bbox.bmax[k] = maxval;
-          }
-        }
-      }
+    for (size_t i = 0; i < n; i++) {  // for each primitive
+      unsigned int idx = indices_[i];
 
+      BBox<T> bbox;
+      p.BoundingBox(&(bbox.bmin), &(bbox.bmax), static_cast<unsigned int>(i));
       bboxes_[idx] = bbox;
 
-      for (int k = 0; k < 3; k++) { // xyz
-        if (bmin[k] > bbox.bmin[k]) {
-          bmin[k] = bbox.bmin[k];
-        }
-        if (bmax[k] < bbox.bmax[k]) {
-          bmax[k] = bbox.bmax[k];
-        }
+      // xyz
+      for (int k = 0; k < 3; k++) {
+        bmin[k] = std::min(bmin[k], bbox.bmin[k]);
+        bmax[k] = std::max(bmax[k], bbox.bmax[k]);
       }
     }
 
   } else {
-
-#ifdef _OPENMP
-    ComputeBoundingBoxOMP(bmin, bmax, vertices, faces, &indices_.at(0), 0, n,
-                          epsScale);
+#if defined(NANORT_USE_CPP11_FEATURE)
+    ComputeBoundingBoxThreaded(&bmin, &bmax, &indices_.at(0), 0, n, p);
+#elif defined(_OPENMP)
+    ComputeBoundingBoxOMP(&bmin, &bmax, &indices_.at(0), 0, n, p);
 #else
-    ComputeBoundingBox(bmin, bmax, vertices, faces, &indices_.at(0), 0, (unsigned int)n,
-                       epsScale);
+    ComputeBoundingBox(&bmin, &bmax, &indices_.at(0), 0, n, p);
 #endif
-  }
-
-  // Find max
-  float3 bsize = bmax - bmin;
-  epsScale = std::abs(bsize[0]);
-  if (epsScale < std::abs(bsize[1])) {
-    epsScale = std::abs(bsize[1]);
-  }
-  if (epsScale < std::abs(bsize[2])) {
-    epsScale = std::abs(bsize[2]);
   }
 
 //
 // 3. Build tree
 //
-#ifdef _OPENMP
-#if NANORT_ENABLE_PARALLEL_BUILD
+#if defined(NANORT_ENABLE_PARALLEL_BUILD)
+#if defined(NANORT_USE_CPP11_FEATURE)
 
-  // Do parallel build for enoughly large dataset.
-  if (n > options.minPrimitivesForParallelBuild) {
+  // Do parallel build for large enough datasets.
+  if (n > options.min_primitives_for_parallel_build) {
+    BuildShallowTree(&nodes_, 0, n, /* root depth */ 0, options.shallow_depth,
+                     p, pred);  // [0, n)
 
-    BuildShallowTree(nodes_, vertices, faces, 0, n, /* root depth */ 0,
-                     options.shallowDepth, epsScale); // [0, n)
-
-    assert(shallowNodeInfos_.size() > 0);
+    assert(shallow_node_infos_.size() > 0);
 
     // Build deeper tree in parallel
-    std::vector<std::vector<BVHNode> > local_nodes(shallowNodeInfos_.size());
-    std::vector<BVHBuildStatistics> local_stats(shallowNodeInfos_.size());
+    std::vector<std::vector<BVHNode<T> > > local_nodes(
+        shallow_node_infos_.size());
+    std::vector<BVHBuildStatistics> local_stats(shallow_node_infos_.size());
 
-#pragma omp parallel for
-    for (int i = 0; i < (int)shallowNodeInfos_.size(); i++) {
-      unsigned int leftIdx = shallowNodeInfos_[i].leftIdx;
-      unsigned int rightIdx = shallowNodeInfos_[i].rightIdx;
-      BuildTree(local_stats[i], local_nodes[i], vertices, faces, leftIdx,
-                rightIdx, options.shallowDepth, epsScale);
+    size_t num_threads = std::min(
+        size_t(kNANORT_MAX_THREADS),
+        std::max(size_t(1), size_t(std::thread::hardware_concurrency())));
+    if (shallow_node_infos_.size() < num_threads) {
+      num_threads = shallow_node_infos_.size();
+    }
+
+    std::vector<std::thread> workers;
+    std::atomic<uint32_t> i(0);
+
+    for (size_t t = 0; t < num_threads; t++) {
+      workers.emplace_back(std::thread([&]() {
+        uint32_t idx = 0;
+        while ((idx = (i++)) < shallow_node_infos_.size()) {
+          // Create thread-local copy of Pred since some mutable variables are
+          // modified during SAH computation.
+          const Pred local_pred = pred;
+          unsigned int left_idx = shallow_node_infos_[size_t(idx)].left_idx;
+          unsigned int right_idx = shallow_node_infos_[size_t(idx)].right_idx;
+          BuildTree(&(local_stats[size_t(idx)]), &(local_nodes[size_t(idx)]),
+                    left_idx, right_idx, options.shallow_depth, p, local_pred);
+        }
+      }));
+    }
+
+    for (auto &t : workers) {
+      t.join();
     }
 
     // Join local nodes
-    for (int i = 0; i < (int)local_nodes.size(); i++) {
-
-      assert(!local_nodes[i].empty());
+    for (size_t ii = 0; ii < local_nodes.size(); ii++) {
+      assert(!local_nodes[ii].empty());
       size_t offset = nodes_.size();
 
-      // Add offset to child index(for branch node).
+      // Add offset to child index (for branch node).
+      for (size_t j = 0; j < local_nodes[ii].size(); j++) {
+        if (local_nodes[ii][j].flag == 0) {  // branch
+          local_nodes[ii][j].data[0] += offset - 1;
+          local_nodes[ii][j].data[1] += offset - 1;
+        }
+      }
+
+      // replace
+      nodes_[shallow_node_infos_[ii].offset] = local_nodes[ii][0];
+
+      // Skip root element of the local node.
+      nodes_.insert(nodes_.end(), local_nodes[ii].begin() + 1,
+                    local_nodes[ii].end());
+    }
+
+    // Join statistics
+    for (size_t ii = 0; ii < local_nodes.size(); ii++) {
+      stats_.max_tree_depth =
+          std::max(stats_.max_tree_depth, local_stats[ii].max_tree_depth);
+      stats_.num_leaf_nodes += local_stats[ii].num_leaf_nodes;
+      stats_.num_branch_nodes += local_stats[ii].num_branch_nodes;
+    }
+
+  } else {
+    // Single thread.
+    BuildTree(&stats_, &nodes_, 0, n,
+              /* root depth */ 0, p, pred);  // [0, n)
+  }
+
+#elif defined(_OPENMP)
+
+  // Do parallel build for large enough datasets.
+  if (n > options.min_primitives_for_parallel_build) {
+    BuildShallowTree(&nodes_, 0, n, /* root depth */ 0, options.shallow_depth,
+                     p, pred);  // [0, n)
+
+    assert(shallow_node_infos_.size() > 0);
+
+    // Build deeper tree in parallel
+    std::vector<std::vector<BVHNode<T> > > local_nodes(
+        shallow_node_infos_.size());
+    std::vector<BVHBuildStatistics> local_stats(shallow_node_infos_.size());
+
+#pragma omp parallel for
+    for (int i = 0; i < static_cast<int>(shallow_node_infos_.size()); i++) {
+      unsigned int left_idx = shallow_node_infos_[size_t(i)].left_idx;
+      unsigned int right_idx = shallow_node_infos_[size_t(i)].right_idx;
+      const Pred local_pred = pred;
+      BuildTree(&(local_stats[size_t(i)]), &(local_nodes[size_t(i)]), left_idx,
+                right_idx, options.shallow_depth, p, local_pred);
+    }
+
+    // Join local nodes
+    for (size_t i = 0; i < local_nodes.size(); i++) {
+      assert(!local_nodes[size_t(i)].empty());
+      size_t offset = nodes_.size();
+
+      // Add offset to child index (for branch node).
       for (size_t j = 0; j < local_nodes[i].size(); j++) {
-        if (local_nodes[i][j].flag == 0) { // branch
+        if (local_nodes[i][j].flag == 0) {  // branch
           local_nodes[i][j].data[0] += offset - 1;
           local_nodes[i][j].data[1] += offset - 1;
         }
       }
 
       // replace
-      nodes_[shallowNodeInfos_[i].offset] = local_nodes[i][0];
+      nodes_[shallow_node_infos_[i].offset] = local_nodes[i][0];
 
       // Skip root element of the local node.
       nodes_.insert(nodes_.end(), local_nodes[i].begin() + 1,
@@ -1579,57 +2150,72 @@ bool BVHAccel::Build(const float *vertices, const unsigned int *faces,
     }
 
     // Join statistics
-    for (int i = 0; i < (int)local_nodes.size(); i++) {
-      stats_.maxTreeDepth =
-          std::max(stats_.maxTreeDepth, local_stats[i].maxTreeDepth);
-      stats_.numLeafNodes += local_stats[i].numLeafNodes;
-      stats_.numBranchNodes += local_stats[i].numBranchNodes;
+    for (size_t i = 0; i < local_nodes.size(); i++) {
+      stats_.max_tree_depth =
+          std::max(stats_.max_tree_depth, local_stats[i].max_tree_depth);
+      stats_.num_leaf_nodes += local_stats[i].num_leaf_nodes;
+      stats_.num_branch_nodes += local_stats[i].num_branch_nodes;
     }
 
   } else {
-    BuildTree(stats_, nodes_, vertices, faces, 0, n, /* root depth */ 0,
-              epsScale); // [0, n)
+    // Single thread
+    BuildTree(&stats_, &nodes_, 0, n,
+              /* root depth */ 0, p, pred);  // [0, n)
   }
 
-#else // !NANORT_ENABLE_PARALLEL_BUILD
+#else  // !NANORT_ENABLE_PARALLEL_BUILD
   {
-    BuildTree(stats_, nodes_, vertices, faces, 0, n, /* root depth */ 0,
-              epsScale); // [0, n)
+    BuildTree(&stats_, &nodes_, 0, n,
+              /* root depth */ 0, p, pred);  // [0, n)
   }
 #endif
-#else // !_OPENMP
-  {
-    BuildTree(stats_, nodes_, vertices, faces, 0, (unsigned int)n, /* root depth */ 0,
-              epsScale); // [0, n)
-  }
-#endif
+#else  // !_OPENMP
 
-  stats_.epsScale = epsScale;
-  epsScale_ = epsScale;
+  // Single thread BVH build
+  {
+    BuildTree(&stats_, &nodes_, 0, n,
+              /* root depth */ 0, p, pred);  // [0, n)
+  }
+#endif
 
   return true;
 }
 
-bool BVHAccel::Dump(const char *filename) {
+template <typename T>
+void BVHAccel<T>::Debug() {
+  for (size_t i = 0; i < indices_.size(); i++) {
+    printf("index[%d] = %d\n", int(i), int(indices_[i]));
+  }
+
+  for (size_t i = 0; i < nodes_.size(); i++) {
+    printf("node[%d] : bmin %f, %f, %f, bmax %f, %f, %f\n", int(i),
+           nodes_[i].bmin[0], nodes_[i].bmin[1], nodes_[i].bmin[2],
+           nodes_[i].bmax[0], nodes_[i].bmax[1], nodes_[i].bmax[2]);
+  }
+}
+
+#if defined(NANORT_ENABLE_SERIALIZATION)
+template <typename T>
+bool BVHAccel<T>::Dump(const char *filename) const {
   FILE *fp = fopen(filename, "wb");
   if (!fp) {
-    fprintf(stderr, "[BVHAccel] Cannot write a file: %s\n", filename);
+    // fprintf(stderr, "[BVHAccel] Cannot write a file: %s\n", filename);
     return false;
   }
 
-  unsigned long long numNodes = nodes_.size();
+  size_t numNodes = nodes_.size();
   assert(nodes_.size() > 0);
 
-  unsigned long long numIndices = indices_.size();
+  size_t numIndices = indices_.size();
 
   size_t r = 0;
-  r = fwrite(&numNodes, sizeof(unsigned long long), 1, fp);
+  r = fwrite(&numNodes, sizeof(size_t), 1, fp);
   assert(r == 1);
 
-  r = fwrite(&nodes_.at(0), sizeof(BVHNode), numNodes, fp);
+  r = fwrite(&nodes_.at(0), sizeof(BVHNode<T>), numNodes, fp);
   assert(r == numNodes);
 
-  r = fwrite(&numIndices, sizeof(unsigned long long), 1, fp);
+  r = fwrite(&numIndices, sizeof(size_t), 1, fp);
   assert(r == 1);
 
   r = fwrite(&indices_.at(0), sizeof(unsigned int), numIndices, fp);
@@ -1640,26 +2226,50 @@ bool BVHAccel::Dump(const char *filename) {
   return true;
 }
 
-bool BVHAccel::Load(const char *filename) {
+template <typename T>
+bool BVHAccel<T>::Dump(FILE *fp) const {
+  size_t numNodes = nodes_.size();
+  assert(nodes_.size() > 0);
+
+  size_t numIndices = indices_.size();
+
+  size_t r = 0;
+  r = fwrite(&numNodes, sizeof(size_t), 1, fp);
+  assert(r == 1);
+
+  r = fwrite(&nodes_.at(0), sizeof(BVHNode<T>), numNodes, fp);
+  assert(r == numNodes);
+
+  r = fwrite(&numIndices, sizeof(size_t), 1, fp);
+  assert(r == 1);
+
+  r = fwrite(&indices_.at(0), sizeof(unsigned int), numIndices, fp);
+  assert(r == numIndices);
+
+  return true;
+}
+
+template <typename T>
+bool BVHAccel<T>::Load(const char *filename) {
   FILE *fp = fopen(filename, "rb");
   if (!fp) {
-    fprintf(stderr, "Cannot open file: %s\n", filename);
+    // fprintf(stderr, "Cannot open file: %s\n", filename);
     return false;
   }
 
-  unsigned long long numNodes;
-  unsigned long long numIndices;
+  size_t numNodes;
+  size_t numIndices;
 
   size_t r = 0;
-  r = fread(&numNodes, sizeof(unsigned long long), 1, fp);
+  r = fread(&numNodes, sizeof(size_t), 1, fp);
   assert(r == 1);
   assert(numNodes > 0);
 
   nodes_.resize(numNodes);
-  r = fread(&nodes_.at(0), sizeof(BVHNode), numNodes, fp);
+  r = fread(&nodes_.at(0), sizeof(BVHNode<T>), numNodes, fp);
   assert(r == numNodes);
 
-  r = fread(&numIndices, sizeof(unsigned long long), 1, fp);
+  r = fread(&numIndices, sizeof(size_t), 1, fp);
   assert(r == 1);
 
   indices_.resize(numIndices);
@@ -1672,155 +2282,156 @@ bool BVHAccel::Load(const char *filename) {
   return true;
 }
 
-namespace {
+template <typename T>
+bool BVHAccel<T>::Load(FILE *fp) {
+  size_t numNodes;
+  size_t numIndices;
 
-const int kMaxStackDepth = 512;
+  size_t r = 0;
+  r = fread(&numNodes, sizeof(size_t), 1, fp);
+  assert(r == 1);
+  assert(numNodes > 0);
 
-inline bool IntersectRayAABB(float &tminOut, // [out]
-                             float &tmaxOut, // [out]
-                             float maxT, float bmin[3], float bmax[3],
-                             float3 rayOrg, float3 rayInvDir,
-                             int rayDirSign[3]) {
-  float tmin, tmax;
+  nodes_.resize(numNodes);
+  r = fread(&nodes_.at(0), sizeof(BVHNode<T>), numNodes, fp);
+  assert(r == numNodes);
 
-  const float min_x = rayDirSign[0] ? bmax[0] : bmin[0];
-  const float min_y = rayDirSign[1] ? bmax[1] : bmin[1];
-  const float min_z = rayDirSign[2] ? bmax[2] : bmin[2];
-  const float max_x = rayDirSign[0] ? bmin[0] : bmax[0];
-  const float max_y = rayDirSign[1] ? bmin[1] : bmax[1];
-  const float max_z = rayDirSign[2] ? bmin[2] : bmax[2];
+  r = fread(&numIndices, sizeof(size_t), 1, fp);
+  assert(r == 1);
 
-  // X
-  const float tmin_x = (min_x - rayOrg[0]) * rayInvDir[0];
-  const float tmax_x = (max_x - rayOrg[0]) * rayInvDir[0];
+  indices_.resize(numIndices);
 
-  // Y
-  const float tmin_y = (min_y - rayOrg[1]) * rayInvDir[1];
-  const float tmax_y = (max_y - rayOrg[1]) * rayInvDir[1];
-
-  tmin = (tmin_x > tmin_y) ? tmin_x : tmin_y;
-  tmax = (tmax_x < tmax_y) ? tmax_x : tmax_y;
-
-  // Z
-  const float tmin_z = (min_z - rayOrg[2]) * rayInvDir[2];
-  const float tmax_z = (max_z - rayOrg[2]) * rayInvDir[2];
-
-  tmin = (tmin > tmin_z) ? tmin : tmin_z;
-  tmax = (tmax < tmax_z) ? tmax : tmax_z;
-
-  //
-  // Hit include (tmin == tmax) edge case(hit 2D plane).
-  //
-  if ((tmax > 0.0) && (tmin <= tmax) && (tmin <= maxT)) {
-
-    tminOut = tmin;
-    tmaxOut = tmax;
-
-    return true;
-  }
-
-  return false; // no hit
-}
-
-inline bool TriangleIsect(float &tInOut, float &uOut, float &vOut,
-                          const float3 &v0, const float3 &v1, const float3 &v2,
-                          const float3 &rayOrg, const float3 &rayDir,
-                          float epsScale) {
-  const float kEPS = std::numeric_limits<float>::epsilon() * epsScale;
-
-  float3 p0(v0[0], v0[1], v0[2]);
-  float3 p1(v1[0], v1[1], v1[2]);
-  float3 p2(v2[0], v2[1], v2[2]);
-  float3 e1, e2;
-  float3 p, s, q;
-
-  e1 = p1 - p0;
-  e2 = p2 - p0;
-
-  p = vcross(rayDir, e2);
-
-  float invDet;
-  float det = vdot(e1, p);
-  if (std::abs(det) < kEPS) { // no-cull
-    return false;
-  }
-
-  invDet = 1.0f / det;
-
-  s = rayOrg - p0;
-  q = vcross(s, e1);
-
-  float u = vdot(s, p) * invDet;
-  float v = vdot(q, rayDir) * invDet;
-  float t = vdot(e2, q) * invDet;
-
-  if (u < 0.0f || u > 1.0f)
-    return false;
-  if (v <= 0.0f || u + v > 1.0f)
-    return false;
-  if (t < 0.0f || t > tInOut)
-    return false;
-
-  tInOut = t;
-  uOut = u;
-  vOut = v;
+  r = fread(&indices_.at(0), sizeof(unsigned int), numIndices, fp);
+  assert(r == numIndices);
 
   return true;
 }
+#endif
 
-inline bool TestLeafNode(Intersection &isect, // [inout]
-                         const BVHNode &node,
-                         const std::vector<unsigned int> &indices,
-                         const float *vertices, const unsigned int *faces,
-                         const Ray &ray, float epsScale, const BVHTraceOptions& traceOptions) {
+template <typename T>
+inline bool IntersectRayAABB(T *tminOut,  // [out]
+                             T *tmaxOut,  // [out]
+                             T min_t, T max_t, const T bmin[3], const T bmax[3],
+                             real3<T> ray_org, real3<T> ray_inv_dir,
+                             int ray_dir_sign[3]);
+template <>
+inline bool IntersectRayAABB<float>(float *tminOut,  // [out]
+                                    float *tmaxOut,  // [out]
+                                    float min_t, float max_t,
+                                    const float bmin[3], const float bmax[3],
+                                    real3<float> ray_org,
+                                    real3<float> ray_inv_dir,
+                                    int ray_dir_sign[3]) {
+  float tmin, tmax;
+
+  const float min_x = ray_dir_sign[0] ? bmax[0] : bmin[0];
+  const float min_y = ray_dir_sign[1] ? bmax[1] : bmin[1];
+  const float min_z = ray_dir_sign[2] ? bmax[2] : bmin[2];
+  const float max_x = ray_dir_sign[0] ? bmin[0] : bmax[0];
+  const float max_y = ray_dir_sign[1] ? bmin[1] : bmax[1];
+  const float max_z = ray_dir_sign[2] ? bmin[2] : bmax[2];
+
+  // X
+  const float tmin_x = (min_x - ray_org[0]) * ray_inv_dir[0];
+  // MaxMult robust BVH traversal(up to 4 ulp).
+  // 1.0000000000000004 for double precision.
+  const float tmax_x = (max_x - ray_org[0]) * ray_inv_dir[0] * 1.00000024f;
+
+  // Y
+  const float tmin_y = (min_y - ray_org[1]) * ray_inv_dir[1];
+  const float tmax_y = (max_y - ray_org[1]) * ray_inv_dir[1] * 1.00000024f;
+
+  // Z
+  const float tmin_z = (min_z - ray_org[2]) * ray_inv_dir[2];
+  const float tmax_z = (max_z - ray_org[2]) * ray_inv_dir[2] * 1.00000024f;
+
+  tmin = safemax(tmin_z, safemax(tmin_y, safemax(tmin_x, min_t)));
+  tmax = safemin(tmax_z, safemin(tmax_y, safemin(tmax_x, max_t)));
+
+  if (tmin <= tmax) {
+    (*tminOut) = tmin;
+    (*tmaxOut) = tmax;
+
+    return true;
+  }
+  return false;  // no hit
+}
+
+template <>
+inline bool IntersectRayAABB<double>(double *tminOut,  // [out]
+                                     double *tmaxOut,  // [out]
+                                     double min_t, double max_t,
+                                     const double bmin[3], const double bmax[3],
+                                     real3<double> ray_org,
+                                     real3<double> ray_inv_dir,
+                                     int ray_dir_sign[3]) {
+  double tmin, tmax;
+
+  const double min_x = ray_dir_sign[0] ? bmax[0] : bmin[0];
+  const double min_y = ray_dir_sign[1] ? bmax[1] : bmin[1];
+  const double min_z = ray_dir_sign[2] ? bmax[2] : bmin[2];
+  const double max_x = ray_dir_sign[0] ? bmin[0] : bmax[0];
+  const double max_y = ray_dir_sign[1] ? bmin[1] : bmax[1];
+  const double max_z = ray_dir_sign[2] ? bmin[2] : bmax[2];
+
+  // X
+  const double tmin_x = (min_x - ray_org[0]) * ray_inv_dir[0];
+  // MaxMult robust BVH traversal(up to 4 ulp).
+  const double tmax_x =
+      (max_x - ray_org[0]) * ray_inv_dir[0] * 1.0000000000000004;
+
+  // Y
+  const double tmin_y = (min_y - ray_org[1]) * ray_inv_dir[1];
+  const double tmax_y =
+      (max_y - ray_org[1]) * ray_inv_dir[1] * 1.0000000000000004;
+
+  // Z
+  const double tmin_z = (min_z - ray_org[2]) * ray_inv_dir[2];
+  const double tmax_z =
+      (max_z - ray_org[2]) * ray_inv_dir[2] * 1.0000000000000004;
+
+  tmin = safemax(tmin_z, safemax(tmin_y, safemax(tmin_x, min_t)));
+  tmax = safemin(tmax_z, safemin(tmax_y, safemin(tmax_x, max_t)));
+
+  if (tmin <= tmax) {
+    (*tminOut) = tmin;
+    (*tmaxOut) = tmax;
+
+    return true;
+  }
+  return false;  // no hit
+}
+
+template <typename T>
+template <class I>
+inline bool BVHAccel<T>::TestLeafNode(const BVHNode<T> &node, const Ray<T> &ray,
+                                      const I &intersector) const {
   bool hit = false;
 
-  unsigned int numTriangles = node.data[0];
+  unsigned int num_primitives = node.data[0];
   unsigned int offset = node.data[1];
 
-  float t = isect.t; // current hit distance
+  T t = intersector.GetT();  // current hit distance
 
-  float3 rayOrg;
-  rayOrg[0] = ray.org[0];
-  rayOrg[1] = ray.org[1];
-  rayOrg[2] = ray.org[2];
+  real3<T> ray_org;
+  ray_org[0] = ray.org[0];
+  ray_org[1] = ray.org[1];
+  ray_org[2] = ray.org[2];
 
-  float3 rayDir;
-  rayDir[0] = ray.dir[0];
-  rayDir[1] = ray.dir[1];
-  rayDir[2] = ray.dir[2];
+  real3<T> ray_dir;
+  ray_dir[0] = ray.dir[0];
+  ray_dir[1] = ray.dir[1];
+  ray_dir[2] = ray.dir[2];
 
-  for (unsigned int i = 0; i < numTriangles; i++) {
-    unsigned int faceIdx = indices[i + offset];
+  for (unsigned int i = 0; i < num_primitives; i++) {
+    unsigned int prim_idx = indices_[i + offset];
 
-    if ((faceIdx < traceOptions.faceIdsRange[0]) || (faceIdx >= traceOptions.faceIdsRange[1])) {
-      continue;
-    }
-
-    int f0 = faces[3 * faceIdx + 0];
-    int f1 = faces[3 * faceIdx + 1];
-    int f2 = faces[3 * faceIdx + 2];
-
-    float3 v0, v1, v2;
-    v0[0] = vertices[3 * f0 + 0];
-    v0[1] = vertices[3 * f0 + 1];
-    v0[2] = vertices[3 * f0 + 2];
-
-    v1[0] = vertices[3 * f1 + 0];
-    v1[1] = vertices[3 * f1 + 1];
-    v1[2] = vertices[3 * f1 + 2];
-
-    v2[0] = vertices[3 * f2 + 0];
-    v2[1] = vertices[3 * f2 + 1];
-    v2[2] = vertices[3 * f2 + 2];
-
-    float u, v;
-    if (TriangleIsect(t, u, v, v0, v1, v2, rayOrg, rayDir, epsScale)) {
+    T local_t = t;
+    if (intersector.Intersect(&local_t, prim_idx)) {
       // Update isect state
-      isect.t = t;
-      isect.u = u;
-      isect.v = v;
-      isect.faceID = faceIdx;
+      t = local_t;
+
+      intersector.Update(t, prim_idx);
       hit = true;
     }
   }
@@ -1828,81 +2439,73 @@ inline bool TestLeafNode(Intersection &isect, // [inout]
   return hit;
 }
 
-inline bool MultiHitTestLeafNode(IsectVector &isects, // [inout]
-                                 int maxIntersections, const BVHNode &node,
-                                 const std::vector<unsigned int> &indices,
-                                 const float *vertices,
-                                 const unsigned int *faces, const Ray &ray,
-                                 float epsScale) {
+#if 0  // TODO(LTE): Implement
+template <typename T> template<class I, class H, class Comp>
+bool BVHAccel<T>::MultiHitTestLeafNode(
+  std::priority_queue<H, std::vector<H>, Comp>  *isect_pq,
+  int max_intersections,
+  const BVHNode<T> &node,
+  const Ray<T> &ray,
+  const I &intersector) const {
   bool hit = false;
 
-  unsigned int numTriangles = node.data[0];
+  unsigned int num_primitives = node.data[0];
   unsigned int offset = node.data[1];
 
-  float t = std::numeric_limits<float>::max();
-  if (isects.size() >= (size_t)maxIntersections) {
-    t = isects.top().t; // current furthest hit distance
+  T t = std::numeric_limits<T>::max();
+  if (isect_pq->size() >= static_cast<size_t>(max_intersections)) {
+    t = isect_pq->top().t;  // current furthest hit distance
   }
 
-  float3 rayOrg;
-  rayOrg[0] = ray.org[0];
-  rayOrg[1] = ray.org[1];
-  rayOrg[2] = ray.org[2];
+  real3<T> ray_org;
+  ray_org[0] = ray.org[0];
+  ray_org[1] = ray.org[1];
+  ray_org[2] = ray.org[2];
 
-  float3 rayDir;
-  rayDir[0] = ray.dir[0];
-  rayDir[1] = ray.dir[1];
-  rayDir[2] = ray.dir[2];
+  real3<T> ray_dir;
+  ray_dir[0] = ray.dir[0];
+  ray_dir[1] = ray.dir[1];
+  ray_dir[2] = ray.dir[2];
 
-  for (unsigned int i = 0; i < numTriangles; i++) {
-    int faceIdx = indices[i + offset];
+  for (unsigned int i = 0; i < num_primitives; i++) {
+    unsigned int prim_idx = indices_[i + offset];
 
-    int f0 = faces[3 * faceIdx + 0];
-    int f1 = faces[3 * faceIdx + 1];
-    int f2 = faces[3 * faceIdx + 2];
+    T local_t = t, u = 0.0f, v = 0.0f;
 
-    float3 v0, v1, v2;
-    v0[0] = vertices[3 * f0 + 0];
-    v0[1] = vertices[3 * f0 + 1];
-    v0[2] = vertices[3 * f0 + 2];
-
-    v1[0] = vertices[3 * f1 + 0];
-    v1[1] = vertices[3 * f1 + 1];
-    v1[2] = vertices[3 * f1 + 2];
-
-    v2[0] = vertices[3 * f2 + 0];
-    v2[1] = vertices[3 * f2 + 1];
-    v2[2] = vertices[3 * f2 + 2];
-
-    float u, v;
-    if (TriangleIsect(t, u, v, v0, v1, v2, rayOrg, rayDir, epsScale)) {
+    if (intersector.Intersect(&local_t, &u, &v, prim_idx))
+    {
       // Update isect state
-      if (isects.size() < (size_t)maxIntersections) {
-        Intersection isect;
-        isect.t = t;
-        isect.u = u;
-        isect.v = v;
-        isect.faceID = faceIdx;
-        isects.push(isect);
-
-        // Update furthest distance to far.
-        t = std::numeric_limits<float>::max();
-
-        hit = true;
-      } else {
-        if (t < isects.top().t) {
-          // delete furthest intersection and add new intersection.
-          isects.pop();
-
-          Intersection isect;
+      if ((local_t > ray.min_t))
+      {
+        if (isect_pq->size() < static_cast<size_t>(max_intersections))
+        {
+          H isect;
+          t = local_t;
           isect.t = t;
           isect.u = u;
           isect.v = v;
-          isect.faceID = faceIdx;
-          isects.push(isect);
+          isect.prim_id = prim_idx;
+          isect_pq->push(isect);
+
+          // Update t to furthest distance.
+          t = ray.max_t;
+
+          hit = true;
+        }
+        else if (local_t < isect_pq->top().t)
+        {
+          // delete furthest intersection and add new intersection.
+          isect_pq->pop();
+
+          H hit;
+          hit.t = local_t;
+          hit.u = u;
+          hit.v = v;
+          hit.prim_id = prim_idx;
+          isect_pq->push(hit);
 
           // Update furthest hit distance
-          t = isects.top().t;
+          t = isect_pq->top().t;
 
           hit = true;
         }
@@ -1912,155 +2515,311 @@ inline bool MultiHitTestLeafNode(IsectVector &isects, // [inout]
 
   return hit;
 }
+#endif
 
-} // namespace
+template <typename T>
+template <class I, class H>
+bool BVHAccel<T>::Traverse(const Ray<T> &ray, const I &intersector, H *isect,
+                           const BVHTraceOptions &options) const {
+  const int kMaxStackDepth = 512;
+  (void)kMaxStackDepth;
 
-bool BVHAccel::Traverse(Intersection &isect, const float *vertices,
-                        const unsigned int *faces, const Ray &ray, const BVHTraceOptions& options) {
-  float hitT = std::numeric_limits<float>::max(); // far = no hit.
+  T hit_t = ray.max_t;
 
-  int nodeStackIndex = 0;
-  int nodeStack[512];
-  nodeStack[0] = 0;
+  int node_stack_index = 0;
+  unsigned int node_stack[512];
+  node_stack[0] = 0;
 
   // Init isect info as no hit
-  isect.t = hitT;
-  isect.u = 0.0;
-  isect.v = 0.0;
-  isect.faceID = -1;
+  intersector.Update(hit_t, static_cast<unsigned int>(-1));
 
-  int dirSign[3];
-  dirSign[0] = ray.dir[0] < 0.0 ? 1 : 0;
-  dirSign[1] = ray.dir[1] < 0.0 ? 1 : 0;
-  dirSign[2] = ray.dir[2] < 0.0 ? 1 : 0;
+  intersector.PrepareTraversal(ray, options);
 
-  // @fixme { Check edge case; i.e., 1/0 }
-  float3 rayInvDir;
-  rayInvDir[0] = 1.0f / ray.dir[0];
-  rayInvDir[1] = 1.0f / ray.dir[1];
-  rayInvDir[2] = 1.0f / ray.dir[2];
+  int dir_sign[3];
+  dir_sign[0] = ray.dir[0] < static_cast<T>(0.0) ? 1 : 0;
+  dir_sign[1] = ray.dir[1] < static_cast<T>(0.0) ? 1 : 0;
+  dir_sign[2] = ray.dir[2] < static_cast<T>(0.0) ? 1 : 0;
 
-  float3 rayOrg;
-  rayOrg[0] = ray.org[0];
-  rayOrg[1] = ray.org[1];
-  rayOrg[2] = ray.org[2];
+  real3<T> ray_inv_dir;
+  real3<T> ray_dir;
+  ray_dir[0] = ray.dir[0];
+  ray_dir[1] = ray.dir[1];
+  ray_dir[2] = ray.dir[2];
 
-  float minT, maxT;
-  while (nodeStackIndex >= 0) {
-    int index = nodeStack[nodeStackIndex];
-    BVHNode &node = nodes_[index];
+  ray_inv_dir = vsafe_inverse(ray_dir);
 
-    nodeStackIndex--;
+  real3<T> ray_org;
+  ray_org[0] = ray.org[0];
+  ray_org[1] = ray.org[1];
+  ray_org[2] = ray.org[2];
 
-    bool hit = IntersectRayAABB(minT, maxT, hitT, node.bmin, node.bmax, rayOrg,
-                                rayInvDir, dirSign);
+  T min_t = std::numeric_limits<T>::max();
+  T max_t = -std::numeric_limits<T>::max();
 
-    if (node.flag == 0) { // branch node
+  while (node_stack_index >= 0) {
+    unsigned int index = node_stack[node_stack_index];
+    const BVHNode<T> &node = nodes_[index];
 
-      if (hit) {
+    node_stack_index--;
 
-        int orderNear = dirSign[node.axis];
-        int orderFar = 1 - orderNear;
+    bool hit = IntersectRayAABB(&min_t, &max_t, ray.min_t, hit_t, node.bmin,
+                                node.bmax, ray_org, ray_inv_dir, dir_sign);
+
+    if (hit) {
+      // Branch node
+      if (node.flag == 0) {
+        int order_near = dir_sign[node.axis];
+        int order_far = 1 - order_near;
 
         // Traverse near first.
-        nodeStack[++nodeStackIndex] = node.data[orderFar];
-        nodeStack[++nodeStackIndex] = node.data[orderNear];
-      }
-
-    } else { // leaf node
-      if (hit) {
-        if (TestLeafNode(isect, node, indices_, vertices, faces, ray,
-                         epsScale_, options)) {
-          hitT = isect.t;
-        }
+        node_stack[++node_stack_index] = node.data[order_far];
+        node_stack[++node_stack_index] = node.data[order_near];
+      } else if (TestLeafNode(node, ray, intersector)) {  // Leaf node
+        hit_t = intersector.GetT();
       }
     }
   }
 
-  assert(nodeStackIndex < kMaxStackDepth);
+  assert(node_stack_index < kNANORT_MAX_STACK_DEPTH);
 
-  if (isect.t < std::numeric_limits<float>::max()) {
+  bool hit = (intersector.GetT() < ray.max_t);
+  intersector.PostTraversal(ray, hit, isect);
+
+  return hit;
+}
+
+template <typename T>
+template <class I>
+inline bool BVHAccel<T>::TestLeafNodeIntersections(
+    const BVHNode<T> &node, const Ray<T> &ray, const int max_intersections,
+    const I &intersector,
+    std::priority_queue<NodeHit<T>, std::vector<NodeHit<T> >,
+                        NodeHitComparator<T> > *isect_pq) const {
+  bool hit = false;
+
+  unsigned int num_primitives = node.data[0];
+  unsigned int offset = node.data[1];
+
+  real3<T> ray_org;
+  ray_org[0] = ray.org[0];
+  ray_org[1] = ray.org[1];
+  ray_org[2] = ray.org[2];
+
+  real3<T> ray_dir;
+  ray_dir[0] = ray.dir[0];
+  ray_dir[1] = ray.dir[1];
+  ray_dir[2] = ray.dir[2];
+
+  intersector.PrepareTraversal(ray);
+
+  for (unsigned int i = 0; i < num_primitives; i++) {
+    unsigned int prim_idx = indices_[i + offset];
+
+    T min_t, max_t;
+
+    if (intersector.Intersect(&min_t, &max_t, prim_idx)) {
+      // Always add to isect lists.
+      NodeHit<T> isect;
+      isect.t_min = min_t;
+      isect.t_max = max_t;
+      isect.node_id = prim_idx;
+
+      if (isect_pq->size() < static_cast<size_t>(max_intersections)) {
+        isect_pq->push(isect);
+      } else if (min_t < isect_pq->top().t_min) {
+        // delete the furthest intersection and add a new intersection.
+        isect_pq->pop();
+
+        isect_pq->push(isect);
+      }
+    }
+  }
+
+  return hit;
+}
+
+template <typename T>
+template <class I>
+bool BVHAccel<T>::ListNodeIntersections(
+    const Ray<T> &ray, int max_intersections, const I &intersector,
+    StackVector<NodeHit<T>, 128> *hits) const {
+  const int kMaxStackDepth = 512;
+
+  T hit_t = ray.max_t;
+
+  int node_stack_index = 0;
+  unsigned int node_stack[512];
+  node_stack[0] = 0;
+
+  // Stores furthest intersection at top
+  std::priority_queue<NodeHit<T>, std::vector<NodeHit<T> >,
+                      NodeHitComparator<T> >
+      isect_pq;
+
+  (*hits)->clear();
+
+  int dir_sign[3];
+  dir_sign[0] = ray.dir[0] < static_cast<T>(0.0) ? 1 : 0;
+  dir_sign[1] = ray.dir[1] < static_cast<T>(0.0) ? 1 : 0;
+  dir_sign[2] = ray.dir[2] < static_cast<T>(0.0) ? 1 : 0;
+
+  real3<T> ray_inv_dir;
+  real3<T> ray_dir;
+
+  ray_dir[0] = ray.dir[0];
+  ray_dir[1] = ray.dir[1];
+  ray_dir[2] = ray.dir[2];
+
+  ray_inv_dir = vsafe_inverse(ray_dir);
+
+  real3<T> ray_org;
+  ray_org[0] = ray.org[0];
+  ray_org[1] = ray.org[1];
+  ray_org[2] = ray.org[2];
+
+  T min_t, max_t;
+
+  while (node_stack_index >= 0) {
+    unsigned int index = node_stack[node_stack_index];
+    const BVHNode<T> &node = nodes_[static_cast<size_t>(index)];
+
+    node_stack_index--;
+
+    bool hit = IntersectRayAABB(&min_t, &max_t, ray.min_t, hit_t, node.bmin,
+                                node.bmax, ray_org, ray_inv_dir, dir_sign);
+
+    if (hit) {
+      // Branch node
+      if (node.flag == 0) {
+        int order_near = dir_sign[node.axis];
+        int order_far = 1 - order_near;
+
+        // Traverse near first.
+        node_stack[++node_stack_index] = node.data[order_far];
+        node_stack[++node_stack_index] = node.data[order_near];
+      } else {  // Leaf node
+        TestLeafNodeIntersections(node, ray, max_intersections, intersector,
+                                  &isect_pq);
+      }
+    }
+  }
+
+  assert(node_stack_index < kMaxStackDepth);
+  (void)kMaxStackDepth;
+
+  if (!isect_pq.empty()) {
+    // Store intesection in reverse order (make it frontmost order)
+    size_t n = isect_pq.size();
+    (*hits)->resize(n);
+
+    for (size_t i = 0; i < n; i++) {
+      const NodeHit<T> &isect = isect_pq.top();
+      (*hits)[n - i - 1] = isect;
+      isect_pq.pop();
+    }
+
     return true;
   }
 
   return false;
 }
 
-bool BVHAccel::MultiHitTraverse(StackVector<Intersection, 128> &isects,
-                                int maxIntersections, const float *vertices,
-                                const unsigned int *faces, Ray &ray) {
-  float hitT = std::numeric_limits<float>::max(); // far = no hit.
+#if 0  // TODO(LTE): Implement
+template <typename T> template<class I, class H, class Comp>
+bool BVHAccel<T>::MultiHitTraverse(const Ray<T> &ray,
+                                         int max_intersections,
+                                         const I &intersector,
+                                         StackVector<H, 128> *hits,
+                                         const BVHTraceOptions& options) const {
+  const int kMaxStackDepth = 512;
 
-  int nodeStackIndex = 0;
-  int nodeStack[512];
-  nodeStack[0] = 0;
+  T hit_t = ray.max_t;
 
-  IsectVector isectPQ;
+  int node_stack_index = 0;
+  unsigned int node_stack[512];
+  node_stack[0] = 0;
 
-  isects->clear();
+  // Stores furthest intersection at top
+  std::priority_queue<H, std::vector<H>, Comp>  isect_pq;
 
-  int dirSign[3];
-  dirSign[0] = ray.dir[0] < 0.0 ? 1 : 0;
-  dirSign[1] = ray.dir[1] < 0.0 ? 1 : 0;
-  dirSign[2] = ray.dir[2] < 0.0 ? 1 : 0;
+  (*hits)->clear();
 
-  // @fixme { Check edge case; i.e., 1/0 }
-  float3 rayInvDir;
-  rayInvDir[0] = 1.0f / ray.dir[0];
-  rayInvDir[1] = 1.0f / ray.dir[1];
-  rayInvDir[2] = 1.0f / ray.dir[2];
+  // Init isect info as no hit
+  intersector.Update(hit_t, static_cast<unsigned int>(-1));
 
-  float3 rayOrg;
-  rayOrg[0] = ray.org[0];
-  rayOrg[1] = ray.org[1];
-  rayOrg[2] = ray.org[2];
+  intersector.PrepareTraversal(ray, options);
 
-  float minT, maxT;
-  while (nodeStackIndex >= 0) {
-    int index = nodeStack[nodeStackIndex];
-    BVHNode &node = nodes_[index];
+  int dir_sign[3];
+  dir_sign[0] = ray.dir[0] < static_cast<T>(0.0) ? static_cast<T>(1) : static_cast<T>(0);
+  dir_sign[1] = ray.dir[1] < static_cast<T>(0.0) ? static_cast<T>(1) : static_cast<T>(0);
+  dir_sign[2] = ray.dir[2] < static_cast<T>(0.0) ? static_cast<T>(1) : static_cast<T>(0);
 
-    nodeStackIndex--;
+  real3<T> ray_inv_dir;
+  real3<T> ray_dir;
 
-    bool hit = IntersectRayAABB(minT, maxT, hitT, node.bmin, node.bmax, rayOrg,
-                                rayInvDir, dirSign);
+  ray_dir[0] = ray.dir[0];
+  ray_dir[1] = ray.dir[1];
+  ray_dir[2] = ray.dir[2];
 
-    if (node.flag == 0) { // branch node
+  ray_inv_dir = vsafe_inverse(ray_dir);
 
-      if (hit) {
+  real3<T> ray_org;
+  ray_org[0] = ray.org[0];
+  ray_org[1] = ray.org[1];
+  ray_org[2] = ray.org[2];
 
-        int orderNear = dirSign[node.axis];
-        int orderFar = 1 - orderNear;
+  T min_t, max_t;
+
+  while (node_stack_index >= 0)
+  {
+    unsigned int index = node_stack[node_stack_index];
+    const BVHNode<T> &node = nodes_[static_cast<size_t>(index)];
+
+    node_stack_index--;
+
+    bool hit = IntersectRayAABB(&min_t, &max_t, ray.min_t, hit_t, node.bmin,
+                                node.bmax, ray_org, ray_inv_dir, dir_sign);
+
+    // branch node
+    if(hit)
+    {
+      if (node.flag == 0)
+      {
+        int order_near = dir_sign[node.axis];
+        int order_far = 1 - order_near;
 
         // Traverse near first.
-        nodeStack[++nodeStackIndex] = node.data[orderFar];
-        nodeStack[++nodeStackIndex] = node.data[orderNear];
+        node_stack[++node_stack_index] = node.data[order_far];
+        node_stack[++node_stack_index] = node.data[order_near];
       }
-
-    } else { // leaf node
-      if (hit) {
-        if (MultiHitTestLeafNode(isectPQ, maxIntersections, node, indices_,
-                                 vertices, faces, ray, epsScale_)) {
-          // Only update `hitT` when queue is full.
-          if (isectPQ.size() >= (size_t)maxIntersections) {
-            hitT = isectPQ.top().t;
+      else
+      {
+        if (MultiHitTestLeafNode(&isect_pq, max_intersections, node, ray, intersector))
+        {
+          // Only update `hit_t` when queue is full.
+          if (isect_pq.size() >= static_cast<size_t>(max_intersections))
+          {
+            hit_t = isect_pq.top().t;
           }
         }
       }
     }
   }
 
-  assert(nodeStackIndex < kMaxStackDepth);
+  assert(node_stack_index < kMaxStackDepth);
+  (void)kMaxStackDepth;
 
-  if (!isectPQ.empty()) {
+  if (!isect_pq.empty())
+  {
+    // Store intesection in reverse order (make it frontmost order)
+    size_t n = isect_pq.size();
+    (*hits)->resize(n);
 
-    // Store intesection in reverse order(make it frontmost order)
-    size_t n = isectPQ.size();
-    isects->resize(n);
-    for (size_t i = 0; i < n; i++) {
-      const Intersection &isect = isectPQ.top();
-      isects[n - i - 1] = isect;
-      isectPQ.pop();
+    for (size_t i = 0; i < n; i++)
+    {
+      const H &isect = isect_pq.top();
+      (*hits)[n - i - 1] = isect;
+      isect_pq.pop();
     }
 
     return true;
@@ -2068,9 +2827,12 @@ bool BVHAccel::MultiHitTraverse(StackVector<Intersection, 128> &isects,
 
   return false;
 }
-
-} // namespace
-
 #endif
 
-#endif // __NANORT_H__
+#ifdef __clang__
+#pragma clang diagnostic pop
+#endif
+
+}  // namespace nanort
+
+#endif  // NANORT_H_
